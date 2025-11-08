@@ -34,6 +34,7 @@ from social_protection.models import Beneficiary, BeneficiaryStatus
 from tasks_management.apps import TasksManagementConfig
 from tasks_management.models import Task
 from tasks_management.services import TaskService, _get_std_task_data_payload
+from payroll.models import PaymentReport
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,11 @@ class PayrollService(BaseService):
     @register_service_signal('payroll_service.close_payroll')
     def close_payroll(self, obj_data):
         payroll_to_close = Payroll.objects.get(id=obj_data['id'])
+        # Enforce presence of at least one payment report (PDF) before closing
+        has_report = PaymentReport.objects.filter(payroll=payroll_to_close, is_deleted=False).exists()
+        if not has_report:
+            return output_exception(model_name=self.OBJECT_TYPE.__name__, method="close_payroll",
+                                    exception=ValueError(_('payment_report.required_before_closing')))
         data = {'id': payroll_to_close.id}
         TaskService(self.user).create({
             'source': 'payroll_reconciliation',
@@ -281,11 +287,31 @@ class CsvReconciliationService:
         # Collect all extra_info keys to ensure all columns are present in the DataFrame
         extra_info_keys = set()
         extra_info_dicts = []  # To store extra_info dicts for each record
+        # Build a lookup to avoid per-record queries
+        benefits_by_code = {b.code: b for b in bc_qs.select_related('individual')}
+        # Pre-fill custom columns from best-effort sources
+        prefill_code_menage = []
+        prefill_numero_paie = []
+        prefill_code_empreinte = []
         for record in records:
-            bc = bc_qs.get(code=record['code'])
+            bc = benefits_by_code.get(record['code'])
             extra_info = bc.json_ext.get('extra_info', {}) if bc.json_ext else {}
             extra_info_keys.update(extra_info.keys())
             extra_info_dicts.append(extra_info)
+            # code_menage: prefer extra_info, else individual.json_ext
+            ind_json = bc.individual.json_ext if getattr(bc, 'individual', None) else None
+            code_menage = extra_info.get('code_menage') if extra_info else None
+            if code_menage is None and ind_json:
+                code_menage = (ind_json or {}).get('code_menage')
+            prefill_code_menage.append(code_menage)
+            # numero_paie: only from provided data (no fallback to code)
+            numero_paie = extra_info.get('numero_paie') if extra_info else None
+            prefill_numero_paie.append(numero_paie)
+            # code_empreinte: prefer extra_info, else individual.json_ext
+            code_empreinte = extra_info.get('code_empreinte') if extra_info else None
+            if code_empreinte is None and ind_json:
+                code_empreinte = (ind_json or {}).get('code_empreinte')
+            prefill_code_empreinte.append(code_empreinte)
 
         # Convert to DataFrame
         df = pd.DataFrame.from_records(records)
@@ -304,6 +330,22 @@ class CsvReconciliationService:
         for key in extra_info_keys:
             df[key] = [extra_info_dict.get(key, None) for extra_info_dict in extra_info_dicts]
 
+        # Ensure additional custom columns exist
+        try:
+            additional_columns = getattr(PayrollConfig, 'csv_reconciliation_additional_columns', []) or []
+        except Exception:
+            additional_columns = []
+        for col in additional_columns:
+            if col not in df.columns:
+                df[col] = None
+        # Pre-fill additional custom columns when possible
+        if 'code_menage' in df.columns and prefill_code_menage:
+            df['code_menage'] = prefill_code_menage
+        if 'numero_paie' in df.columns and prefill_numero_paie:
+            df['numero_paie'] = prefill_numero_paie
+        if 'code_empreinte' in df.columns and prefill_code_empreinte:
+            df['code_empreinte'] = prefill_code_empreinte
+
         in_memory_file = BytesIO()
         # BytesIO is duck-typed as a file object, so it can be passed to df.to_csv
         # noinspection PyTypeChecker
@@ -317,7 +359,10 @@ class CsvReconciliationService:
         upload.save(username=self.user.login_name)
         if not file:
             raise ValueError(_('csv_reconciliation.validation.file_required'))
+        
+        # Lecture uniquement CSV
         df = pd.read_csv(file)
+        
         self._validate_dataframe(df)
         df.rename(columns={v: k for k, v in PayrollConfig.csv_reconciliation_field_mapping.items()}, inplace=True)
 

@@ -106,3 +106,9 @@ class PayrollMutation(UUIDModel, ObjectMutation):
     payroll = models.ForeignKey(Payroll, models.DO_NOTHING, related_name='mutations')
     mutation = models.ForeignKey(
         MutationLog, models.DO_NOTHING, related_name='payroll')
+
+
+class PaymentReport(HistoryModel):
+    payroll = models.ForeignKey(Payroll, on_delete=models.DO_NOTHING)
+    uploaded_by = models.ForeignKey(User, on_delete=models.DO_NOTHING, null=True, blank=True)
+    file_name = models.CharField(max_length=255, null=False, blank=False)

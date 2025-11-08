@@ -39,6 +39,12 @@ DEFAULT_CONFIG = {
     "csv_reconciliation_code_column": "code",
     "csv_reconciliation_paid_yes": "Yes",
     "csv_reconciliation_paid_no": "No",
+    # Additional custom columns to always include in generated reconciliation files
+    "csv_reconciliation_additional_columns": [
+        "code_menage",
+        "numero_paie",
+        "code_empreinte",
+    ],
     "payroll_delete_event": "payroll.payroll_delete",
     "benefit_delete_event": "payroll.benefit_delete",
 
@@ -132,3 +138,9 @@ class PayrollConfig(AppConfig):
         if file_name:
             return f"csv_reconciliation/payroll_{payroll_id}/{file_name}"
         return f"csv_reconciliation/payroll_{payroll_id}"
+
+    @staticmethod
+    def get_payroll_report_file_path(payroll_id, file_name=None):
+        if file_name:
+            return f"payment_reports/payroll_{payroll_id}/{file_name}"
+        return f"payment_reports/payroll_{payroll_id}"
