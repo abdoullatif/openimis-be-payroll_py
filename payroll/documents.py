@@ -240,7 +240,7 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
             'status': opensearch_fields.KeywordField(),
             'type': opensearch_fields.KeywordField(),
             'receipt': opensearch_fields.KeywordField(),
-            'amount': opensearch_fields.KeywordField(),
+            'amount': opensearch_fields.FloatField(),
             'photo': opensearch_fields.KeywordField(),
             'date_due': opensearch_fields.DateField(),
             'individual': opensearch_fields.ObjectField(properties={
@@ -259,6 +259,15 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
             'payment_cycle_code': opensearch_fields.KeywordField(),
             'payment_cycle_start_date': opensearch_fields.DateField(),
             'payment_cycle_end_date': opensearch_fields.DateField()
+        })
+        location = opensearch_fields.ObjectField(properties={
+            'code': opensearch_fields.KeywordField(),
+            'name': opensearch_fields.KeywordField(),
+            'type': opensearch_fields.KeywordField(),
+            'region': opensearch_fields.KeywordField(),
+            'prefecture': opensearch_fields.KeywordField(),
+            'sous_prefecture': opensearch_fields.KeywordField(),
+            'district': opensearch_fields.KeywordField(),
         })
 
         class Index:
@@ -335,6 +344,50 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
             
             return data
 
+        def prepare_location(self, instance):
+            individual = getattr(instance.benefit, 'individual', None)
+            location = getattr(individual, 'location', None)
+            if not location and individual:
+                group_rel = individual.groupindividuals.select_related('group__location').first()
+                if group_rel and group_rel.group and group_rel.group.location:
+                    location = group_rel.group.location
+
+            if not location and individual and getattr(individual, 'json_ext', None):
+                json_ext = individual.json_ext or {}
+                return {
+                    'region': json_ext.get('region'),
+                    'prefecture': json_ext.get('prefecture'),
+                    'sous_prefecture': json_ext.get('sous_prefecture'),
+                    'district': json_ext.get('district'),
+                }
+
+            if not location:
+                return None
+
+            data = {
+                'code': location.code,
+                'name': location.name,
+                'type': location.type,
+            }
+
+            current = location
+            while current:
+                loc_type = getattr(current, 'type', None)
+                if loc_type == 'R':
+                    data.setdefault('region', current.name)
+                    data.setdefault('prefecture', current.name)
+                elif loc_type == 'P':
+                    data.setdefault('prefecture', current.name)
+                elif loc_type == 'S':
+                    data.setdefault('sous_prefecture', current.name)
+                elif loc_type == 'D':
+                    data.setdefault('district', current.name)
+                elif loc_type == 'W':
+                    data.setdefault('sous_prefecture', current.name)
+                current = current.parent
+
+            return data
+
         def get_instances_from_related(self, related_instance):
             if isinstance(related_instance, Payroll):
                 return PayrollBenefitConsumption.objects.filter(payroll=related_instance)
@@ -357,7 +410,7 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
             'date_created': opensearch_fields.DateField(),
             'date_due': opensearch_fields.DateField(),
             'date_payed': opensearch_fields.DateField(),
-            'amount_total': opensearch_fields.KeywordField(),
+            'amount_total': opensearch_fields.FloatField(),
         })
         benefit = opensearch_fields.ObjectField(properties={
             'code': opensearch_fields.KeywordField(),
@@ -381,6 +434,18 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
             'is_monetary_transfer': opensearch_fields.BooleanField(),
             'payment_cycle_code': opensearch_fields.KeywordField()
         })
+        location = opensearch_fields.ObjectField(properties={
+            'code': opensearch_fields.KeywordField(),
+            'name': opensearch_fields.KeywordField(),
+            'type': opensearch_fields.KeywordField(),
+            'region': opensearch_fields.KeywordField(),
+            'prefecture': opensearch_fields.KeywordField(),
+            'sous_prefecture': opensearch_fields.KeywordField(),
+            'district': opensearch_fields.KeywordField(),
+        })
+        payment_plan_codes = opensearch_fields.KeywordField()
+        payment_cycle_codes = opensearch_fields.KeywordField()
+        payroll_names = opensearch_fields.KeywordField()
         payroll = opensearch_fields.NestedField(properties={
             'name': opensearch_fields.KeywordField(),
             'status': opensearch_fields.KeywordField(),
@@ -423,3 +488,124 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
                 return BenefitAttachment.objects.filter(bill=related_instance)
             elif isinstance(related_instance, BenefitConsumption):
                 return BenefitAttachment.objects.filter(benefit=related_instance)
+
+        def prepare(self, instance):
+            data = super().prepare(instance)
+
+            if instance.benefit and instance.benefit.individual:
+                individual_json = instance.benefit.individual.json_ext or {}
+                if 'individual' in data.get('benefit', {}):
+                    data['benefit']['individual']['gender'] = (
+                        individual_json.get('gender') or
+                        getattr(instance.benefit.individual, 'gender', None)
+                    )
+
+                beneficiary = Beneficiary.objects.filter(
+                    individual=instance.benefit.individual,
+                    status=BeneficiaryStatus.ACTIVE,
+                    is_deleted=False
+                ).order_by('-date_valid_from').first()
+
+                if not beneficiary:
+                    beneficiary = Beneficiary.objects.filter(
+                        individual=instance.benefit.individual,
+                        is_deleted=False
+                    ).order_by('-date_valid_from').first()
+
+                if beneficiary and beneficiary.benefit_plan:
+                    bp = beneficiary.benefit_plan
+                    data['benefit']['benefit_plan'] = {
+                        'id': str(bp.id) if hasattr(bp, 'id') else None,
+                        'code': getattr(bp, 'code', None),
+                        'name': getattr(bp, 'name', None) or str(bp),
+                    }
+                else:
+                    pbc = PayrollBenefitConsumption.objects.filter(
+                        benefit=instance.benefit
+                    ).select_related('payroll__payment_plan__benefit_plan', 'payroll__payment_cycle').first()
+                    if pbc and pbc.payroll and pbc.payroll.payment_plan and pbc.payroll.payment_plan.benefit_plan:
+                        bp = pbc.payroll.payment_plan.benefit_plan
+                        data['benefit']['benefit_plan'] = {
+                            'id': str(bp.id) if hasattr(bp, 'id') else None,
+                            'code': getattr(bp, 'code', None),
+                            'name': getattr(bp, 'name', None) or str(bp),
+                        }
+                    if pbc and pbc.payroll and pbc.payroll.payment_cycle:
+                        data['benefit']['payment_cycle_code'] = getattr(pbc.payroll.payment_cycle, 'code', None)
+
+            return data
+
+        def prepare_location(self, instance):
+            individual = getattr(instance.benefit, 'individual', None)
+            location = getattr(individual, 'location', None)
+            if not location and individual and getattr(individual, 'json_ext', None):
+                json_ext = individual.json_ext or {}
+                return {
+                    'region': json_ext.get('region'),
+                    'prefecture': json_ext.get('prefecture'),
+                    'sous_prefecture': json_ext.get('sous_prefecture'),
+                    'district': json_ext.get('district'),
+                }
+
+            if not location:
+                return None
+
+            data = {
+                'code': location.code,
+                'name': location.name,
+                'type': location.type,
+            }
+
+            current = location
+            while current:
+                loc_type = getattr(current, 'type', None)
+                if loc_type == 'R':
+                    data.setdefault('region', current.name)
+                    data.setdefault('prefecture', current.name)
+                elif loc_type == 'P':
+                    data.setdefault('prefecture', current.name)
+                elif loc_type == 'S':
+                    data.setdefault('sous_prefecture', current.name)
+                elif loc_type == 'D':
+                    data.setdefault('district', current.name)
+                elif loc_type == 'W':
+                    data.setdefault('sous_prefecture', current.name)
+                current = current.parent
+
+            return data
+
+        def prepare_payment_plan_codes(self, instance):
+            payrolls = PayrollBenefitConsumption.objects.filter(
+                benefit=instance.benefit
+            ).select_related("payroll", "payroll__payment_plan")
+
+            codes = []
+            for item in payrolls:
+                payment_plan = getattr(item.payroll, "payment_plan", None)
+                if payment_plan and payment_plan.code:
+                    codes.append(payment_plan.code)
+            return codes
+
+        def prepare_payment_cycle_codes(self, instance):
+            payrolls = PayrollBenefitConsumption.objects.filter(
+                benefit=instance.benefit
+            ).select_related("payroll", "payroll__payment_cycle")
+
+            codes = []
+            for item in payrolls:
+                payment_cycle = getattr(item.payroll, "payment_cycle", None)
+                if payment_cycle and payment_cycle.code:
+                    codes.append(payment_cycle.code)
+            return codes
+
+        def prepare_payroll_names(self, instance):
+            payrolls = PayrollBenefitConsumption.objects.filter(
+                benefit=instance.benefit
+            ).select_related("payroll")
+
+            names = []
+            for item in payrolls:
+                payroll = getattr(item, "payroll", None)
+                if payroll and payroll.name:
+                    names.append(payroll.name)
+            return names
