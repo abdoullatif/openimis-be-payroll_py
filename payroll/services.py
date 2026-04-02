@@ -162,6 +162,7 @@ class PayrollService(BaseService):
 
     def make_payment_for_payroll(self, obj_data):
         payroll_id = obj_data['id']
+        logger.info("[Payroll] make_payment_for_payroll: queuing task for payroll_id=%s", payroll_id)
         send_requests_to_gateway_payment.delay(payroll_id, self.user.id)
 
     def _save_payroll(self, obj_data):
@@ -330,11 +331,12 @@ class CsvReconciliationService:
         for key in extra_info_keys:
             df[key] = [extra_info_dict.get(key, None) for extra_info_dict in extra_info_dicts]
 
-        # Ensure additional custom columns exist
+        # Ensure additional custom columns exist (fallback if ModuleConfiguration override)
+        _default_additional = ["code_menage", "numero_paie", "code_empreinte"]
         try:
-            additional_columns = getattr(PayrollConfig, 'csv_reconciliation_additional_columns', []) or []
+            additional_columns = getattr(PayrollConfig, 'csv_reconciliation_additional_columns', None) or _default_additional
         except Exception:
-            additional_columns = []
+            additional_columns = _default_additional
         for col in additional_columns:
             if col not in df.columns:
                 df[col] = None
@@ -426,12 +428,57 @@ class CsvReconciliationService:
             raise ValueError('csv_reconciliation.validation.payroll_not_found')
         return payroll
 
+    def _get_additional_columns(self):
+        _default = ["code_menage", "numero_paie", "code_empreinte"]
+        try:
+            return getattr(PayrollConfig, 'csv_reconciliation_additional_columns', None) or _default
+        except Exception:
+            return _default
+
+    def _validate_additional_columns(self, row, bc, errors):
+        """Valide le format et la cohérence des colonnes additionnelles."""
+        max_length = 255
+        for col in self._get_additional_columns():
+            if col not in row.index:
+                continue
+            val = row[col]
+            val_str = "" if (pd.isna(val) or not str(val).strip()) else str(val).strip()
+
+            # code_menage : requis et identique à individual.json_ext["code_menage"]
+            if col == 'code_menage' and bc and getattr(bc, 'individual', None):
+                ind_json = (bc.individual.json_ext or {}) if bc.individual.json_ext else {}
+                ind_code_menage = ind_json.get('code_menage')
+                ind_code_menage_str = (
+                    str(ind_code_menage).strip() if ind_code_menage is not None and str(ind_code_menage).strip()
+                    else None
+                )
+                if ind_code_menage_str is None:
+                    errors.append(_('Individual must have code_menage (household code)'))
+                elif not val_str:
+                    errors.append(_('code_menage is required in the reconciliation file'))
+                elif val_str != ind_code_menage_str:
+                    errors.append(
+                        _('code_menage must match the individual household code: expected "%(expected)s"')
+                        % {'expected': ind_code_menage_str}
+                    )
+                continue
+
+            if not val_str:
+                continue
+            if len(val_str) > max_length:
+                errors.append(
+                    _('Column "%(column)s" exceeds maximum length of %(max)s characters')
+                    % {'column': col, 'max': max_length}
+                )
+
     def _reconcile_row(self, payroll, row):
         errors = []
-        bc = BenefitConsumption.objects.filter(code=row['code'], is_deleted=False).first()
+        bc = BenefitConsumption.objects.filter(
+            code=row['code'], is_deleted=False
+        ).select_related('individual').first()
         if not bc:
             errors.append(_('benefit_consumption_not_found'))
-        if not bc.payrollbenefitconsumption_set.filter(payroll=payroll).exists():
+        if bc and not bc.payrollbenefitconsumption_set.filter(payroll=payroll).exists():
             errors.append(_('benefit_consumption_not_in_payroll'))
         if (row[PayrollConfig.csv_reconciliation_paid_extra_field]
                 and row[PayrollConfig.csv_reconciliation_paid_extra_field]
@@ -444,7 +491,10 @@ class CsvReconciliationService:
         if bc and bc.status != row['status']:
             errors.append(_('status_not_matching'))
 
+        self._validate_additional_columns(row, bc, errors)
+
         if (not errors
+                and bc
                 and (row[PayrollConfig.csv_reconciliation_paid_extra_field] == PayrollConfig.csv_reconciliation_paid_yes
                      and bc.status == BenefitConsumptionStatus.ACCEPTED)):
             self._reconcile_bc(row, bc)
@@ -454,8 +504,12 @@ class CsvReconciliationService:
     def _reconcile_bc(self, row, bc):
         bc.status = BenefitConsumptionStatus.RECONCILED
         bc.receipt = row[PayrollConfig.csv_reconciliation_receipt_column]
-        extra_info = {k: row[k] for k in row.index
-                      if k not in PayrollConfig.csv_reconciliation_field_mapping and not pd.isna(row[k])}
+        excluded = set(PayrollConfig.csv_reconciliation_field_mapping)
+        excluded.add(PayrollConfig.csv_reconciliation_errors_column)
+        extra_info = {
+            k: row[k] for k in row.index
+            if k not in excluded and not pd.isna(row[k]) and str(row[k]).strip()
+        }
         bc.json_ext = {'extra_info': extra_info}
         bc.save(username=self.user.login_name)
         bill = Bill.objects.filter(benefitattachment__benefit=bc, is_deleted=False).first()

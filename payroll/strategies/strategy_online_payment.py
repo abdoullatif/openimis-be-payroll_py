@@ -51,7 +51,7 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
             payrollbenefitconsumption__is_deleted=False,
             payrollbenefitconsumption__payroll__is_deleted=False,
         )
-        benefits = BenefitConsumption.objects.filter(filters)
+        benefits = BenefitConsumption.objects.filter(filters).select_related("individual")
         return benefits
 
     @classmethod
@@ -148,8 +148,13 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
         benefits = cls.get_benefits_attached_to_payroll(payroll, BenefitConsumptionStatus.ACCEPTED)
         payment_gateway_connector = cls.PAYMENT_GATEWAY
         benefits_to_approve = []
+        projet, campagne = cls._get_project_and_campaign(payroll)
         for benefit in benefits:
-            if payment_gateway_connector.send_payment(benefit.code, benefit.amount):
+            code_menage = cls._get_code_menage(benefit)
+            if payment_gateway_connector.send_payment(
+                benefit.code, benefit.amount,
+                projet=projet, campagne=campagne, code_menage=code_menage
+            ):
                 benefits_to_approve.append(benefit)
             else:
                 # Handle the case where a benefit payment is rejected
@@ -161,6 +166,27 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
     def _process_accepted_payroll(cls, payroll, user, **kwargs):
         from payroll.models import PayrollStatus
         cls.change_status_of_payroll(payroll, PayrollStatus.APPROVE_FOR_PAYMENT, user)
+
+    @classmethod
+    def _get_code_menage(cls, benefit):
+        """code_menage depuis extra_info du benefit ou json_ext de l'individual"""
+        extra_info = (benefit.json_ext or {}).get("extra_info") or {}
+        code_menage = extra_info.get("code_menage")
+        if code_menage is None and benefit.individual and benefit.individual.json_ext:
+            code_menage = (benefit.individual.json_ext or {}).get("code_menage")
+        return code_menage
+
+    @classmethod
+    def _get_project_and_campaign(cls, payroll):
+        """projet = BenefitPlan.code, campagne = PaymentPlan.code"""
+        projet = campagne = None
+        payment_plan = getattr(payroll, "payment_plan", None)
+        if payment_plan:
+            campagne = getattr(payment_plan, "code", None)
+            benefit_plan = getattr(payment_plan, "benefit_plan", None)
+            if benefit_plan:
+                projet = getattr(benefit_plan, "code", None)
+        return projet, campagne
 
     @classmethod
     def _save_payroll_data(cls, payroll, user, response_from_gateway):
