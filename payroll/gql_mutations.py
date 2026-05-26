@@ -147,13 +147,13 @@ class CreatePayrollMutation(BaseHistoryModelCreateMutationMixin, BaseMutation):
 
     @classmethod
     def _mutate(cls, user, **data):
-        client_mutation_id = data.pop('client_mutation_id', None)
         if "client_mutation_label" in data:
             data.pop('client_mutation_label')
 
+        client_mutation_id = data.get("client_mutation_id")
         service = PayrollService(user)
         response = service.create(data)
-        if client_mutation_id and response['success']:
+        if client_mutation_id and response.get("success"):
             payroll_id = response['data']['id']
             payroll = Payroll.objects.get(id=payroll_id)
             PayrollMutation.object_mutated(
@@ -223,6 +223,101 @@ class ClosePayrollMutation(BaseHistoryModelDeleteMutationMixin, BaseMutation):
 
     class Input(DeletePayrollInputType):
         pass
+
+
+class TriggerPayrollReconciliationMutation(BaseHistoryModelDeleteMutationMixin, BaseMutation):
+    _mutation_class = "TriggerPayrollReconciliationMutation"
+    _mutation_module = "payroll"
+    _model = Payroll
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        super()._validate_mutation(user, **data)
+        if not user.has_perms(PayrollConfig.gql_payroll_create_perms):
+            raise ValidationError("mutation.authentication_required")
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        if "client_mutation_id" in data:
+            data.pop('client_mutation_id')
+        if "client_mutation_label" in data:
+            data.pop('client_mutation_label')
+
+        service = PayrollService(user)
+        ids = data.get('ids')
+        if ids:
+            with transaction.atomic():
+                for id in ids:
+                    service.trigger_payroll_reconciliation({'id': id})
+
+    class Input(DeletePayrollInputType):
+        pass
+
+
+class CancelPayrollPaymentMutation(BaseHistoryModelDeleteMutationMixin, BaseMutation):
+    _mutation_class = "CancelPayrollPaymentMutation"
+    _mutation_module = "payroll"
+    _model = Payroll
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        super()._validate_mutation(user, **data)
+        if not user.has_perms(PayrollConfig.gql_payroll_create_perms):
+            raise ValidationError("mutation.authentication_required")
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        if "client_mutation_id" in data:
+            data.pop("client_mutation_id")
+        if "client_mutation_label" in data:
+            data.pop("client_mutation_label")
+
+        service = PayrollService(user)
+        ids = data.get("ids")
+        reason = data.get("reason")
+        if ids:
+            with transaction.atomic():
+                for payroll_id in ids:
+                    payload = {"id": payroll_id}
+                    if reason:
+                        payload["reason"] = reason
+                    service.cancel_payment_for_payroll(payload)
+
+    class Input(DeletePayrollInputType):
+        reason = graphene.String(required=False)
+
+
+class CancelPayrollReconciliationMutation(BaseHistoryModelDeleteMutationMixin, BaseMutation):
+    _mutation_class = "CancelPayrollReconciliationMutation"
+    _mutation_module = "payroll"
+    _model = Payroll
+
+    @classmethod
+    def _validate_mutation(cls, user, **data):
+        super()._validate_mutation(user, **data)
+        if not user.has_perms(PayrollConfig.gql_payroll_create_perms):
+            raise ValidationError("mutation.authentication_required")
+
+    @classmethod
+    def _mutate(cls, user, **data):
+        if "client_mutation_id" in data:
+            data.pop("client_mutation_id")
+        if "client_mutation_label" in data:
+            data.pop("client_mutation_label")
+
+        service = PayrollService(user)
+        ids = data.get("ids")
+        reason = data.get("reason")
+        if ids:
+            with transaction.atomic():
+                for payroll_id in ids:
+                    payload = {"id": payroll_id}
+                    if reason:
+                        payload["reason"] = reason
+                    service.cancel_reconciliation_for_payroll(payload)
+
+    class Input(DeletePayrollInputType):
+        reason = graphene.String(required=False)
 
 
 class MakePaymentForPayrollMutation(BaseHistoryModelDeleteMutationMixin, BaseMutation):

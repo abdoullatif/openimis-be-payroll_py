@@ -57,37 +57,74 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
     @classmethod
     def approve_for_payment_benefit_consumption(cls, benefits, user):
         from payroll.models import BenefitConsumptionStatus
+        from payroll.opensearch_payroll_status_sync import benefit_status_only_save
+
         for benefit in benefits:
             try:
                 benefit.status = BenefitConsumptionStatus.APPROVE_FOR_PAYMENT
-                benefit.save(username=user.login_name)
+                benefit_status_only_save(benefit, user.login_name)
             except Exception as e:
                 logger.debug(f"Failed to approve benefit consumption {benefit.code}: {str(e)}")
 
     @classmethod
-    def reconcile_benefit_consumption(cls, benefits, user):
-        from payroll.models import BenefitConsumptionStatus
+    def reconcile_benefit_consumption(cls, benefits, user, operator_receipts=None):
+        from payroll.models import BenefitConsumptionStatus, PayrollBenefitConsumption
         from payroll.apps import PayrollConfig
+        from payroll.opensearch_payroll_status_sync import (
+            benefit_status_only_save,
+            skip_heavy_opensearch_reindex,
+            sync_benefit_status_batch_to_opensearch,
+        )
         from invoice.models import Bill
+
+        operator_receipts = operator_receipts or {}
+        benefit_ids_for_os = []
+        payroll_id = None
+        os_batch_size = 500
+
         for benefit in benefits:
             try:
-                receipt = CodeGenerator.generate_unique_code(
-                    'payroll',
-                    'BenefitConsumption',
-                    'receipt',
-                    PayrollConfig.receipt_length,
+                receipt = (
+                    operator_receipts.get(str(benefit.id))
+                    or operator_receipts.get(benefit.code)
                 )
+                if not receipt:
+                    receipt = CodeGenerator.generate_unique_code(
+                        'payroll',
+                        'BenefitConsumption',
+                        'receipt',
+                        PayrollConfig.receipt_length,
+                    )
                 benefit.receipt = receipt
                 benefit.status = BenefitConsumptionStatus.RECONCILED
-                benefit.save(username=user.login_name)
+                benefit_status_only_save(benefit, user.login_name)
+                benefit_ids_for_os.append(benefit.id)
+                if payroll_id is None:
+                    payroll_id = (
+                        PayrollBenefitConsumption.objects.filter(
+                            benefit_id=benefit.id,
+                            is_deleted=False,
+                        )
+                        .values_list("payroll_id", flat=True)
+                        .first()
+                    )
                 bill = Bill.objects.filter(
                     benefitattachment__benefit=benefit,
                     is_deleted=False
                 ).first()
                 if bill:
-                    cls._create_bill_payment_for_paid_bill(benefit, bill, user)
+                    with skip_heavy_opensearch_reindex():
+                        cls._create_bill_payment_for_paid_bill(benefit, bill, user)
             except Exception as e:
                 logger.debug(f"Failed to approve benefit consumption {benefit.code}: {str(e)}")
+
+        if payroll_id and benefit_ids_for_os:
+            for offset in range(0, len(benefit_ids_for_os), os_batch_size):
+                sync_benefit_status_batch_to_opensearch(
+                    payroll_id,
+                    benefit_ids_for_os[offset : offset + os_batch_size],
+                    BenefitConsumptionStatus.RECONCILED,
+                )
 
     @classmethod
     def _create_bill_payment_for_paid_bill(cls, benefit, bill, user):
@@ -144,28 +181,97 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
 
     @classmethod
     def _send_payment_data_to_gateway(cls, payroll, user):
+        """
+        Exécuté uniquement dans le worker Celery (send_requests_to_gateway_payment).
+        Appels passerelle + save DB avec skip OpenSearch ; sync léger par lots.
+        """
         from payroll.models import BenefitConsumptionStatus
-        benefits = cls.get_benefits_attached_to_payroll(payroll, BenefitConsumptionStatus.ACCEPTED)
+        from payroll.payment_progress import (
+            complete_payroll_payment_progress,
+            fail_payroll_payment_progress,
+            start_payroll_payment_progress,
+            update_payroll_payment_progress,
+        )
+        from payroll.opensearch_payroll_status_sync import (
+            benefit_status_only_save,
+            sync_benefit_status_batch_to_opensearch,
+        )
+
+        benefits = list(
+            cls.get_benefits_attached_to_payroll(payroll, BenefitConsumptionStatus.ACCEPTED)
+        )
+        total = len(benefits)
+        payroll_id = str(payroll.id)
+        username = user.login_name
+        start_payroll_payment_progress(payroll_id, total, username=username)
+
         payment_gateway_connector = cls.PAYMENT_GATEWAY
-        benefits_to_approve = []
         projet, campagne = cls._get_project_and_campaign(payroll)
-        for benefit in benefits:
-            code_menage = cls._get_code_menage(benefit)
-            if payment_gateway_connector.send_payment(
-                benefit.code, benefit.amount,
-                projet=projet, campagne=campagne, code_menage=code_menage
-            ):
-                benefits_to_approve.append(benefit)
-            else:
-                # Handle the case where a benefit payment is rejected
-                logger.info(f"Payment for benefit ({benefit.code}) was rejected.")
-        if benefits_to_approve:
-            cls.approve_for_payment_benefit_consumption(benefits_to_approve, user)
+        pending_os_sync_ids = []
+        success_count = 0
+        rejected_count = 0
+        os_batch_size = 500
+
+        try:
+            for index, benefit in enumerate(benefits, start=1):
+                code_menage = cls._get_code_menage(benefit)
+                if payment_gateway_connector.send_payment(
+                    benefit.code,
+                    benefit.amount,
+                    projet=projet,
+                    campagne=campagne,
+                    code_menage=code_menage,
+                ):
+                    benefit.status = BenefitConsumptionStatus.APPROVE_FOR_PAYMENT
+                    benefit_status_only_save(benefit, user.login_name)
+                    pending_os_sync_ids.append(benefit.id)
+                    success_count += 1
+                else:
+                    rejected_count += 1
+                    logger.info("Payment for benefit (%s) was rejected.", benefit.code)
+
+                update_payroll_payment_progress(
+                    payroll_id,
+                    index,
+                    total,
+                    success_count=success_count,
+                    rejected_count=rejected_count,
+                    username=username,
+                )
+
+                if len(pending_os_sync_ids) >= os_batch_size:
+                    sync_benefit_status_batch_to_opensearch(
+                        payroll_id,
+                        pending_os_sync_ids,
+                        BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
+                    )
+                    pending_os_sync_ids = []
+
+            if pending_os_sync_ids:
+                sync_benefit_status_batch_to_opensearch(
+                    payroll_id,
+                    pending_os_sync_ids,
+                    BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
+                )
+
+            complete_payroll_payment_progress(
+                payroll_id,
+                total,
+                total,
+                success_count=success_count,
+                rejected_count=rejected_count,
+                username=username,
+            )
+        except Exception as exc:
+            fail_payroll_payment_progress(payroll_id, exc, username=username)
+            raise
 
     @classmethod
     def _process_accepted_payroll(cls, payroll, user, **kwargs):
         from payroll.models import PayrollStatus
-        cls.change_status_of_payroll(payroll, PayrollStatus.APPROVE_FOR_PAYMENT, user)
+        cls.change_status_of_payroll(
+            payroll, PayrollStatus.APPROVE_FOR_PAYMENT, user, opensearch_status_only=True
+        )
 
     @classmethod
     def _get_code_menage(cls, benefit):
@@ -177,12 +283,21 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
         return code_menage
 
     @classmethod
+    def _get_payroll_campaign(cls, payroll):
+        """Nom de la paie (Payroll.name) envoyé à la passerelle comme campagne."""
+        if not payroll:
+            return None
+        name = getattr(payroll, "name", None)
+        return str(name).strip() if name else None
+
+    @classmethod
     def _get_project_and_campaign(cls, payroll):
-        """projet = BenefitPlan.code, campagne = PaymentPlan.code"""
+        """projet = BenefitPlan.code, campagne = Payroll.name."""
         projet = campagne = None
+        if payroll:
+            campagne = cls._get_payroll_campaign(payroll)
         payment_plan = getattr(payroll, "payment_plan", None)
         if payment_plan:
-            campagne = getattr(payment_plan, "code", None)
             benefit_plan = getattr(payment_plan, "benefit_plan", None)
             if benefit_plan:
                 projet = getattr(benefit_plan, "code", None)

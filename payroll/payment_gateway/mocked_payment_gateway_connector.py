@@ -1,6 +1,10 @@
 import logging
 
 from payroll.payment_gateway.payment_gateway_connector import PaymentGatewayConnector
+from payroll.reconciliation_payload import (
+    build_reconciliation_payload,
+    parse_reconciliation_gateway_response,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -61,16 +65,13 @@ class MockedPaymentGatewayConnector(PaymentGatewayConnector):
         return False
 
     def reconcile(self, invoice_id, amount, **kwargs):
-        projet = kwargs.get("projet")
-        campagne = kwargs.get("campagne")
-        code_menage = kwargs.get("code_menage")
-        payload = {
-            "invoiceId": str(invoice_id),
-            "amount": str(amount),
-            "projet": str(projet) if projet is not None else "",
-            "campagne": str(campagne) if campagne is not None else "",
-            "codeMenage": str(code_menage) if code_menage is not None else "",
-        }
+        payload = build_reconciliation_payload(
+            invoice_id,
+            amount,
+            projet=kwargs.get("projet"),
+            campagne=kwargs.get("campagne"),
+            code_menage=kwargs.get("code_menage"),
+        )
         response = self.send_request(self.config.endpoint_reconciliation, payload)
         if response:
             logger.info(
@@ -78,9 +79,4 @@ class MockedPaymentGatewayConnector(PaymentGatewayConnector):
                 response.status_code,
                 response.text,
             )
-            response_text = response.text.strip().lower()
-            if response_text == "true":
-                return True
-            elif response_text == "false":
-                return False
-        return False
+        return parse_reconciliation_gateway_response(response)

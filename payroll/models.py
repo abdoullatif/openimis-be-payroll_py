@@ -72,6 +72,11 @@ class BenefitConsumption(HistoryBusinessModel):
         max_length=100, choices=BenefitConsumptionStatus.choices, default=BenefitConsumptionStatus.ACCEPTED, null=False
     )
 
+    class Meta:
+        indexes = [
+            models.Index(fields=['code'], name='payroll_benefit_code_idx'),
+        ]
+
     def __str__(self):
         return f"Benefit Consumption {self.code} - {self.receipt} - {self.amount}"
 

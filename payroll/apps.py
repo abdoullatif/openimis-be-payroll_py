@@ -7,6 +7,24 @@ from payroll.payments_registry import PaymentsMethodRegistryPoint
 
 MODULE_NAME = 'payroll'
 
+
+def _reopen_mutation_after_create_payroll(
+    sender, mutation_log_id, error_messages=None, **kwargs
+):
+    """Après mark_as_successful du core : garder RECEIVED pendant l'indexation OS."""
+    if getattr(sender, "__name__", None) != "CreatePayrollMutation":
+        return
+    if error_messages:
+        return
+    from core.models import MutationLog
+
+    mutation_log = MutationLog.objects.filter(id=mutation_log_id).first()
+    if not mutation_log or not mutation_log.client_mutation_id:
+        return
+    from payroll.opensearch_indexing_progress import reopen_mutation_log_for_opensearch_indexing
+
+    reopen_mutation_log_for_opensearch_indexing(mutation_log.client_mutation_id)
+
 DEFAULT_CONFIG = {
     "gql_payment_point_search_perms": ["201001"],
     "gql_payment_point_create_perms": ["201002"],
@@ -58,7 +76,12 @@ DEFAULT_CONFIG = {
     "payment_gateway_timeout": int(os.getenv("PAYMENT_GATEWAY_TIMEOUT", "5")),
     "payment_gateway_auth_type": os.getenv("PAYMENT_GATEWAY_AUTH_TYPE", "basic"),
     "payment_gateway_class": "payroll.payment_gateway.MockedPaymentGatewayConnector",
-    "receipt_length": 8
+    "receipt_length": 8,
+    "reconciliation_callback_api_key": os.getenv(
+        "RECONCILIATION_CALLBACK_API_KEY",
+        os.getenv("PAYMENT_GATEWAY_API_KEY"),
+    ),
+    "reconciliation_callback_username": os.getenv("PAYROLL_RECONCILIATION_CALLBACK_USERNAME", "Admin"),
 }
 
 
@@ -99,10 +122,21 @@ class PayrollConfig(AppConfig):
     payment_gateway_auth_type = None
     payment_gateway_class = None
     receipt_length = None
+    reconciliation_callback_api_key = None
+    reconciliation_callback_username = None
 
     def ready(self):
         from core.models import ModuleConfiguration
+        from core.schema import signal_mutation_module_after_mutating
+        from payroll.mutation_log_gql_extension import register_mutation_log_task_bar_fields
 
+        import payroll.tasks  # noqa: F401 — enregistrement tâches Celery
+
+        register_mutation_log_task_bar_fields()
+        signal_mutation_module_after_mutating["payroll"].connect(
+            _reopen_mutation_after_create_payroll,
+            weak=False,
+        )
         cfg = ModuleConfiguration.get_or_default(self.name, DEFAULT_CONFIG)
         self.__load_config(cfg)
         self.__register_filters_and_payment_methods()

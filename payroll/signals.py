@@ -44,10 +44,18 @@ def bind_service_signals():
             logger.error("Error while executing on_task_complete_accept_payroll", exc_info=exc)
 
     def on_task_complete_payroll_reconcilation(**kwargs):
-        def reconcile_payroll(payroll, user):
+        """Validation métier après Accept and Close : passage en RECONCILED, sans relancer la passerelle."""
+        def validate_reconciled_payroll(payroll, user):
+            from payroll.models import PayrollStatus
             strategy = PaymentMethodStorage.get_chosen_payment_method(payroll.payment_method)
             if strategy:
-                strategy.reconcile_payroll(payroll, user)
+                strategy.change_status_of_payroll(
+                    payroll,
+                    PayrollStatus.RECONCILED,
+                    user,
+                    opensearch_status_only=True,
+                )
+
         try:
             result = kwargs.get('result', None)
             task = result['data']['task']
@@ -58,7 +66,7 @@ def bind_service_signals():
                 task_status = task['status']
                 if task_status == Task.Status.COMPLETED:
                     payroll = Payroll.objects.get(id=task['entity_id'])
-                    reconcile_payroll(payroll, user)
+                    validate_reconciled_payroll(payroll, user)
         except Exception as exc:
             logger.error("Error while executing on_task_complete_payroll_reconciliation", exc_info=exc)
 

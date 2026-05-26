@@ -19,9 +19,26 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
     from individual.models import Individual
     from invoice.models import Bill
     from social_protection.models import Beneficiary, BenefitPlan, BeneficiaryStatus
+    from payroll.opensearch_creation_context import (
+        benefit_plan_for_individual,
+        get_payroll_creation_opensearch_context,
+        payment_cycle_fields_from_creation_context,
+    )
+
+    class PayrollSkipAwareDocument(BaseSyncDocument):
+        """Ignore les saves en masse (tâche Celery paiement / flags json_ext)."""
+
+        def update(self, thing, action, *args, refresh=None, using=None, **kwargs):
+            from payroll.opensearch_payroll_status_sync import (
+                should_skip_heavy_opensearch_reindex,
+            )
+
+            if should_skip_heavy_opensearch_reindex():
+                return None
+            return super().update(thing, action, *args, refresh=refresh, using=using, **kwargs)
 
     @registry.register_document
-    class PayrollDocument(BaseSyncDocument):
+    class PayrollDocument(PayrollSkipAwareDocument):
         DASHBOARD_NAME = 'Payment'
 
         name = opensearch_fields.KeywordField()
@@ -83,7 +100,7 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
 
 
     @registry.register_document
-    class BenefitConsumptionDocument(BaseSyncDocument):
+    class BenefitConsumptionDocument(PayrollSkipAwareDocument):
         DASHBOARD_NAME = 'Payment'
 
         photo = opensearch_fields.KeywordField()
@@ -132,72 +149,49 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
         def prepare(self, instance):
             """Préparer les données pour l'indexation avec les champs calculés"""
             data = super().prepare(instance)
-            # Pré-calcule le lien vers le payroll si existant
+            creation_ctx = get_payroll_creation_opensearch_context()
             payroll_bc = None
-            try:
-                payroll_bc = instance.payrollbenefitconsumption_set.first()
-            except Exception:
-                payroll_bc = None
-            
-            # Récupérer le genre de l'individu
+            if not creation_ctx:
+                try:
+                    payroll_bc = (
+                        instance.payrollbenefitconsumption_set.select_related(
+                            "payroll",
+                            "payroll__payment_cycle",
+                            "payroll__payment_plan",
+                        ).first()
+                    )
+                except Exception:
+                    payroll_bc = None
+
             if instance.individual:
-                # Essayer de récupérer le genre depuis json_ext ou directement
                 individual_json = instance.individual.json_ext or {}
                 data['individual']['gender'] = individual_json.get('gender') or instance.individual.gender if hasattr(instance.individual, 'gender') else None
                 data['individual']['id'] = str(getattr(instance.individual, 'id', None))
-            
-            # Récupérer le benefit_plan depuis les données RÉELLES : Individual -> Beneficiary -> BenefitPlan
-            benefit_plan_data = None
-            if instance.individual:
-                # Récupérer le Beneficiary actif de l'individu au moment de la consommation
-                # On prend le Beneficiary actif le plus récent ou celui qui correspond à la date de consommation
-                beneficiary = Beneficiary.objects.filter(
-                    individual=instance.individual,
-                    status=BeneficiaryStatus.ACTIVE,
-                    is_deleted=False
-                ).order_by('-date_valid_from').first()
-                
-                # Si pas de bénéficiaire actif, prendre le plus récent même si suspendu/graduated
-                if not beneficiary:
-                    beneficiary = Beneficiary.objects.filter(
-                        individual=instance.individual,
-                        is_deleted=False
-                    ).order_by('-date_valid_from').first()
-                
-                if beneficiary and beneficiary.benefit_plan:
-                    bp = beneficiary.benefit_plan
-                    benefit_plan_data = {
+
+            data['benefit_plan'] = benefit_plan_for_individual(instance.individual)
+            if not data['benefit_plan'] and payroll_bc and payroll_bc.payroll and payroll_bc.payroll.payment_plan:
+                payment_plan = payroll_bc.payroll.payment_plan
+                if payment_plan and payment_plan.benefit_plan:
+                    bp = payment_plan.benefit_plan
+                    data['benefit_plan'] = {
                         'id': str(bp.id) if hasattr(bp, 'id') else None,
                         'code': getattr(bp, 'code', None),
                         'name': getattr(bp, 'name', None) or str(bp),
                     }
-            
-            # Fallback: si pas de Beneficiary trouvé, essayer via PaymentPlan (pour compatibilité)
-            if not benefit_plan_data:
-                if payroll_bc and payroll_bc.payroll and payroll_bc.payroll.payment_plan:
-                    payment_plan = payroll_bc.payroll.payment_plan
-                    if payment_plan and payment_plan.benefit_plan:
-                        bp = payment_plan.benefit_plan
-                        benefit_plan_data = {
-                            'id': str(bp.id) if hasattr(bp, 'id') else None,
-                            'code': getattr(bp, 'code', None),
-                            'name': getattr(bp, 'name', None) or str(bp),
-                        }
-            
-            data['benefit_plan'] = benefit_plan_data
-            
-            # Déterminer si c'est un transfert monétaire (type = 'monetary' ou amount > 0)
+
             data['is_monetary_transfer'] = (
                 instance.type and 'monetary' in str(instance.type).lower()
             ) or (instance.amount and float(instance.amount) > 0)
-            
-            # Récupérer les infos du cycle de paiement
-            if payroll_bc and payroll_bc.payroll and payroll_bc.payroll.payment_cycle:
+
+            cycle_fields = payment_cycle_fields_from_creation_context()
+            if cycle_fields:
+                data.update(cycle_fields)
+            elif payroll_bc and payroll_bc.payroll and payroll_bc.payroll.payment_cycle:
                 cycle = payroll_bc.payroll.payment_cycle
                 data['payment_cycle_code'] = getattr(cycle, 'code', None)
                 data['payment_cycle_start_date'] = getattr(cycle, 'start_date', None)
                 data['payment_cycle_end_date'] = getattr(cycle, 'end_date', None)
-            
+
             return data
 
         def get_instances_from_related(self, related_instance):
@@ -216,7 +210,7 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
 
 
     @registry.register_document
-    class PayrollBenefitConsumptionDocument(BaseSyncDocument):
+    class PayrollBenefitConsumptionDocument(PayrollSkipAwareDocument):
         DASHBOARD_NAME = 'Payment'
 
         payroll = opensearch_fields.ObjectField(properties={
@@ -300,27 +294,9 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
                     )
                     data['benefit']['individual']['id'] = str(getattr(instance.benefit.individual, 'id', None))
                 
-                # Récupérer benefit_plan depuis les données RÉELLES : Individual -> Beneficiary -> BenefitPlan
-                beneficiary = Beneficiary.objects.filter(
-                    individual=instance.benefit.individual,
-                    status=BeneficiaryStatus.ACTIVE,
-                    is_deleted=False
-                ).order_by('-date_valid_from').first()
-                
-                if not beneficiary:
-                    beneficiary = Beneficiary.objects.filter(
-                        individual=instance.benefit.individual,
-                        is_deleted=False
-                    ).order_by('-date_valid_from').first()
-                
-                if beneficiary and beneficiary.benefit_plan:
-                    bp = beneficiary.benefit_plan
-                    data['benefit']['benefit_plan'] = {
-                        'id': str(bp.id) if hasattr(bp, 'id') else None,
-                        'code': getattr(bp, 'code', None),
-                        'name': getattr(bp, 'name', None) or str(bp),
-                    }
-                # Fallback via PaymentPlan si pas de Beneficiary
+                plan = benefit_plan_for_individual(instance.benefit.individual)
+                if plan:
+                    data['benefit']['benefit_plan'] = plan
                 elif instance.payroll and instance.payroll.payment_plan:
                     payment_plan = instance.payroll.payment_plan
                     if payment_plan and payment_plan.benefit_plan:
@@ -330,7 +306,7 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
                             'code': getattr(bp, 'code', None),
                             'name': getattr(bp, 'name', None) or str(bp),
                         }
-            
+
             # Ajouter is_monetary_transfer
             if instance.benefit:
                 data['benefit']['is_monetary_transfer'] = (
@@ -346,6 +322,10 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
 
         def prepare_location(self, instance):
             individual = getattr(instance.benefit, 'individual', None)
+            creation_ctx = get_payroll_creation_opensearch_context()
+            if creation_ctx and individual:
+                return creation_ctx.location_by_individual.get(str(individual.id))
+
             location = getattr(individual, 'location', None)
             if not location and individual:
                 group_rel = individual.groupindividuals.select_related('group__location').first()
@@ -390,13 +370,25 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
 
         def get_instances_from_related(self, related_instance):
             if isinstance(related_instance, Payroll):
+                from payroll.opensearch_payroll_status_sync import (
+                    should_skip_payroll_related_reindex,
+                )
+
+                if should_skip_payroll_related_reindex():
+                    return PayrollBenefitConsumption.objects.none()
                 return PayrollBenefitConsumption.objects.filter(payroll=related_instance)
             elif isinstance(related_instance, BenefitConsumption):
+                from payroll.opensearch_payroll_status_sync import (
+                    should_skip_heavy_opensearch_reindex,
+                )
+
+                if should_skip_heavy_opensearch_reindex():
+                    return PayrollBenefitConsumption.objects.none()
                 return PayrollBenefitConsumption.objects.filter(benefit=related_instance)
 
 
     @registry.register_document
-    class BenefitAttachmentDocument(BaseSyncDocument):
+    class BenefitAttachmentDocument(PayrollSkipAwareDocument):
         DASHBOARD_NAME = 'Invoice'
 
         bill = opensearch_fields.ObjectField(properties={
@@ -481,12 +473,24 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
 
         def get_instances_from_related(self, related_instance):
             if isinstance(related_instance, Payroll):
+                from payroll.opensearch_payroll_status_sync import (
+                    should_skip_payroll_related_reindex,
+                )
+
+                if should_skip_payroll_related_reindex():
+                    return BenefitAttachment.objects.none()
                 return BenefitAttachment.objects.filter(
                     benefit__payrollbenefitconsumption__payroll=related_instance
                 )
             elif isinstance(related_instance, Bill):
                 return BenefitAttachment.objects.filter(bill=related_instance)
             elif isinstance(related_instance, BenefitConsumption):
+                from payroll.opensearch_payroll_status_sync import (
+                    should_skip_heavy_opensearch_reindex,
+                )
+
+                if should_skip_heavy_opensearch_reindex():
+                    return BenefitAttachment.objects.none()
                 return BenefitAttachment.objects.filter(benefit=related_instance)
 
         def prepare(self, instance):
@@ -500,29 +504,16 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
                         getattr(instance.benefit.individual, 'gender', None)
                     )
 
-                beneficiary = Beneficiary.objects.filter(
-                    individual=instance.benefit.individual,
-                    status=BeneficiaryStatus.ACTIVE,
-                    is_deleted=False
-                ).order_by('-date_valid_from').first()
-
-                if not beneficiary:
-                    beneficiary = Beneficiary.objects.filter(
-                        individual=instance.benefit.individual,
-                        is_deleted=False
-                    ).order_by('-date_valid_from').first()
-
-                if beneficiary and beneficiary.benefit_plan:
-                    bp = beneficiary.benefit_plan
-                    data['benefit']['benefit_plan'] = {
-                        'id': str(bp.id) if hasattr(bp, 'id') else None,
-                        'code': getattr(bp, 'code', None),
-                        'name': getattr(bp, 'name', None) or str(bp),
-                    }
-                else:
+                plan = benefit_plan_for_individual(instance.benefit.individual)
+                if plan:
+                    data['benefit']['benefit_plan'] = plan
+                elif not get_payroll_creation_opensearch_context():
                     pbc = PayrollBenefitConsumption.objects.filter(
                         benefit=instance.benefit
-                    ).select_related('payroll__payment_plan__benefit_plan', 'payroll__payment_cycle').first()
+                    ).select_related(
+                        'payroll__payment_plan__benefit_plan_type',
+                        'payroll__payment_cycle',
+                    ).first()
                     if pbc and pbc.payroll and pbc.payroll.payment_plan and pbc.payroll.payment_plan.benefit_plan:
                         bp = pbc.payroll.payment_plan.benefit_plan
                         data['benefit']['benefit_plan'] = {
@@ -530,13 +521,29 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
                             'code': getattr(bp, 'code', None),
                             'name': getattr(bp, 'name', None) or str(bp),
                         }
+
+                creation_ctx = get_payroll_creation_opensearch_context()
+                if creation_ctx and creation_ctx.payroll.payment_cycle:
+                    data['benefit']['payment_cycle_code'] = getattr(
+                        creation_ctx.payroll.payment_cycle, 'code', None
+                    )
+                elif not creation_ctx:
+                    pbc = PayrollBenefitConsumption.objects.filter(
+                        benefit=instance.benefit
+                    ).select_related('payroll__payment_cycle').first()
                     if pbc and pbc.payroll and pbc.payroll.payment_cycle:
-                        data['benefit']['payment_cycle_code'] = getattr(pbc.payroll.payment_cycle, 'code', None)
+                        data['benefit']['payment_cycle_code'] = getattr(
+                            pbc.payroll.payment_cycle, 'code', None
+                        )
 
             return data
 
         def prepare_location(self, instance):
             individual = getattr(instance.benefit, 'individual', None)
+            creation_ctx = get_payroll_creation_opensearch_context()
+            if creation_ctx and individual:
+                return creation_ctx.location_by_individual.get(str(individual.id))
+
             location = getattr(individual, 'location', None)
             if not location and individual and getattr(individual, 'json_ext', None):
                 json_ext = individual.json_ext or {}
@@ -574,7 +581,17 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
 
             return data
 
+        def prepare_payroll(self, instance):
+            creation_ctx = get_payroll_creation_opensearch_context()
+            if creation_ctx:
+                return creation_ctx.payroll_nested_doc
+            return []
+
         def prepare_payment_plan_codes(self, instance):
+            creation_ctx = get_payroll_creation_opensearch_context()
+            if creation_ctx:
+                return creation_ctx.payment_plan_codes
+
             payrolls = PayrollBenefitConsumption.objects.filter(
                 benefit=instance.benefit
             ).select_related("payroll", "payroll__payment_plan")
@@ -587,6 +604,10 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
             return codes
 
         def prepare_payment_cycle_codes(self, instance):
+            creation_ctx = get_payroll_creation_opensearch_context()
+            if creation_ctx:
+                return creation_ctx.payment_cycle_codes
+
             payrolls = PayrollBenefitConsumption.objects.filter(
                 benefit=instance.benefit
             ).select_related("payroll", "payroll__payment_cycle")
@@ -599,6 +620,10 @@ if 'opensearch_reports' in apps.app_configs and not is_unit_test_env:
             return codes
 
         def prepare_payroll_names(self, instance):
+            creation_ctx = get_payroll_creation_opensearch_context()
+            if creation_ctx:
+                return creation_ctx.payroll_names
+
             payrolls = PayrollBenefitConsumption.objects.filter(
                 benefit=instance.benefit
             ).select_related("payroll")

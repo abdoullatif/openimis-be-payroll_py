@@ -13,17 +13,28 @@ from location.services import get_ancestor_location_filter
 from payroll.apps import PayrollConfig
 from payroll.gql_mutations import CreatePaymentPointMutation, UpdatePaymentPointMutation, DeletePaymentPointMutation, \
     CreatePayrollMutation, DeletePayrollMutation, ClosePayrollMutation, \
-    RejectPayrollMutation, MakePaymentForPayrollMutation, DeleteBenefitConsumptionMutation
+    RejectPayrollMutation, MakePaymentForPayrollMutation, CancelPayrollPaymentMutation, \
+    CancelPayrollReconciliationMutation, TriggerPayrollReconciliationMutation, \
+    DeleteBenefitConsumptionMutation
 from payroll.gql_queries import BenefitConsumptionGQLType, PaymentPointGQLType, \
     PayrollGQLType, PaymentMethodGQLType, \
     PaymentMethodListGQLType, BenefitAttachmentListGQLType, \
     CsvReconciliationUploadGQLType, PayrollBenefitConsumptionGQLType, \
     PaymentGatewayConfigGQLType, BenefitsSummaryGQLType
+from payroll.mutation_poll_status import PayrollMutationPollStatusGQLType
 from payroll.models import PaymentPoint, Payroll, \
     BenefitConsumption, BenefitAttachment, \
     CsvReconciliationUpload, PayrollBenefitConsumption, BenefitConsumptionStatus
 from payroll.payments_registry import PaymentMethodStorage
 from social_protection.models import BenefitPlan
+
+
+class PayrollConnectionField(OrderedDjangoFilterConnectionField):
+    """Tri par défaut : date_created DESC (plus récent en premier)."""
+
+    @classmethod
+    def orderBy(cls, qs, args):
+        return qs.order_by("-date_created")
 
 
 class Query(graphene.ObjectType):
@@ -34,7 +45,7 @@ class Query(graphene.ObjectType):
         parent_location=graphene.String(),
         parent_location_level=graphene.Int(),
     )
-    payroll = OrderedDjangoFilterConnectionField(
+    payroll = PayrollConnectionField(
         PayrollGQLType,
         orderBy=graphene.List(of_type=graphene.String),
         dateValidFrom__Gte=graphene.DateTime(),
@@ -76,7 +87,18 @@ class Query(graphene.ObjectType):
         applyDefaultValidityFilter=graphene.Boolean(),
         client_mutation_id=graphene.String(),
         payroll_uuid=graphene.UUID(required=True),
-        filterOnlyUnpaid=graphene.Boolean()
+        filterOnlyUnpaid=graphene.Boolean(),
+        benefit_status=graphene.String(
+            description=(
+                "Filtre serveur sur BenefitConsumption.status "
+                "(ex. APPROVE_FOR_PAYMENT). Nommé benefitStatus en GraphQL."
+            ),
+        ),
+    )
+
+    benefit_consumption_status_counts = graphene.JSONString(
+        payroll_uuid=graphene.UUID(required=True),
+        description="Compteurs par statut {STATUS: n} sans charger les lignes.",
     )
 
     benefit_attachment_by_payroll = OrderedDjangoFilterConnectionField(
@@ -113,6 +135,72 @@ class Query(graphene.ObjectType):
         paymentCycleUuid=graphene.String(),
     )
 
+    payroll_creation_progress = graphene.JSONString(
+        payroll_id=graphene.UUID(),
+        client_mutation_id=graphene.String(),
+    )
+
+    payroll_payment_progress = graphene.JSONString(
+        payroll_id=graphene.UUID(required=True),
+    )
+
+    payroll_reconciliation_progress = graphene.JSONString(
+        payroll_id=graphene.UUID(required=True),
+    )
+
+    payroll_mutation_poll_status = graphene.Field(
+        PayrollMutationPollStatusGQLType,
+        client_mutation_id=graphene.String(required=True),
+        payroll_id=graphene.UUID(
+            description="Optionnel : état paiement si le journal de mutation est absent.",
+        ),
+    )
+
+    def resolve_payroll_mutation_poll_status(self, info, client_mutation_id, payroll_id=None):
+        from payroll.mutation_poll_status import resolve_payroll_mutation_poll_status
+
+        return resolve_payroll_mutation_poll_status(
+            info, client_mutation_id, payroll_id=payroll_id
+        )
+
+    def resolve_payroll_payment_progress(self, info, payroll_id):
+        from payroll.payment_progress import reconcile_payment_progress_for_payroll
+
+        Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        payroll = Payroll.objects.filter(id=payroll_id, is_deleted=False).first()
+        if not payroll:
+            return None
+        return reconcile_payment_progress_for_payroll(payroll)
+
+    def resolve_payroll_reconciliation_progress(self, info, payroll_id):
+        from payroll.reconciliation_progress import reconcile_reconciliation_progress_for_payroll
+
+        Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        payroll = Payroll.objects.filter(id=payroll_id, is_deleted=False).first()
+        if not payroll:
+            return None
+        return reconcile_reconciliation_progress_for_payroll(payroll)
+
+    def resolve_payroll_creation_progress(self, info, payroll_id=None, client_mutation_id=None):
+        from payroll.creation_progress import (
+            get_payroll_creation_progress,
+            get_payroll_creation_progress_by_mutation,
+        )
+
+        Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        if client_mutation_id:
+            return get_payroll_creation_progress_by_mutation(client_mutation_id)
+        if payroll_id:
+            return get_payroll_creation_progress(str(payroll_id))
+        from payroll.creation_progress import STATUS_IN_PROGRESS
+
+        return {
+            "status": STATUS_IN_PROGRESS,
+            "should_stop_polling": False,
+            "error": None,
+            "percent": 0,
+        }
+
     def resolve_bill_by_payroll(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
         filters = [*append_validity_filter(**kwargs), Q(payrollbill__payroll_id=kwargs.get("payroll_uuid"),
@@ -135,24 +223,35 @@ class Query(graphene.ObjectType):
 
         return gql_optimizer.query(Bill.objects.filter(*filters), info)
 
-    def resolve_benefit_consumption_by_payroll(self, info, **kwargs):
-        Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
-        filters = [*append_validity_filter(**kwargs),
-                   Q(payrollbenefitconsumption__payroll_id=kwargs.get("payroll_uuid"),
-                     is_deleted=False,
-                     payrollbenefitconsumption__is_deleted=False,
-                     payrollbenefitconsumption__payroll__is_deleted=False)]
+    def resolve_benefit_consumption_status_counts(self, info, payroll_uuid):
+        from payroll.benefit_consumption_query import benefit_consumption_status_counts_for_payroll
 
+        Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        return benefit_consumption_status_counts_for_payroll(payroll_uuid)
+
+    def resolve_benefit_consumption_by_payroll(self, info, **kwargs):
+        from payroll.benefit_consumption_query import benefit_consumption_queryset_for_payroll
+
+        Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
+        payroll_uuid = kwargs.get("payroll_uuid")
         client_mutation_id = kwargs.get("client_mutation_id", None)
         if client_mutation_id:
             wait_for_mutation(client_mutation_id)
-            filters.append(Q(mutations__mutation__client_mutation_id=client_mutation_id))
 
-        filter_only_unpaid = kwargs.get("filterOnlyUnpaid", None)
-        if filter_only_unpaid:
-            filters.append(Q(status__in=[BenefitConsumptionStatus.ACCEPTED, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT]))
+        queryset = benefit_consumption_queryset_for_payroll(
+            payroll_uuid,
+            status=kwargs.get("benefit_status"),
+            filter_only_unpaid=kwargs.get("filterOnlyUnpaid"),
+        )
+        if client_mutation_id:
+            queryset = queryset.filter(
+                mutations__mutation__client_mutation_id=client_mutation_id
+            )
+        validity = append_validity_filter(**kwargs)
+        if validity:
+            queryset = queryset.filter(*validity)
 
-        return gql_optimizer.query(BenefitConsumption.objects.filter(*filters), info)
+        return gql_optimizer.query(queryset, info)
 
     def resolve_benefit_attachment_by_payroll(self, info, **kwargs):
         Query._check_permissions(info.context.user, PayrollConfig.gql_payroll_search_perms)
@@ -194,7 +293,7 @@ class Query(graphene.ObjectType):
             wait_for_mutation(client_mutation_id)
             filters.append(Q(mutations__mutation__client_mutation_id=client_mutation_id))
 
-        query = Payroll.objects.filter(*filters)
+        query = Payroll.objects.filter(*filters).order_by("-date_created")
         return gql_optimizer.query(query, info)
 
     def resolve_payroll_benefit_consumption(self, info, **kwargs):
@@ -323,4 +422,12 @@ class Mutation(graphene.ObjectType):
     close_payroll = ClosePayrollMutation.Field()
     reject_payroll = RejectPayrollMutation.Field()
     make_payment_for_payroll = MakePaymentForPayrollMutation.Field()
+    cancel_payroll_payment = CancelPayrollPaymentMutation.Field()
+    cancel_payroll_reconciliation = CancelPayrollReconciliationMutation.Field()
+    trigger_payroll_reconciliation = TriggerPayrollReconciliationMutation.Field()
     delete_benefit_consumption = DeleteBenefitConsumptionMutation.Field()
+
+
+from payroll.mutation_log_gql_extension import register_mutation_log_task_bar_fields
+
+register_mutation_log_task_bar_fields()

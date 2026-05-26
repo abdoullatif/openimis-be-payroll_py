@@ -70,9 +70,14 @@ class StrategyOfPaymentInterface(object,  metaclass=abc.ABCMeta):
         pass
 
     @classmethod
-    def change_status_of_payroll(cls, payroll, status, user):
+    def change_status_of_payroll(cls, payroll, status, user, opensearch_status_only=False):
         payroll.status = status
-        payroll.save(username=user.login_name)
+        if opensearch_status_only:
+            from payroll.opensearch_payroll_status_sync import payroll_status_only_save
+
+            payroll_status_only_save(payroll, user)
+        else:
+            payroll.save(username=user.login_name)
 
     @classmethod
     def remove_benefits_from_rejected_payroll(cls, payroll):

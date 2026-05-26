@@ -2,7 +2,7 @@ import logging
 
 from django.db import transaction
 from rest_framework import views
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, authentication_classes, permission_classes
 from rest_framework.response import Response
 
 from core.utils import DefaultStorageFileHandler
@@ -10,6 +10,8 @@ from core.views import check_user_rights
 from payroll.apps import PayrollConfig
 from payroll.models import Payroll, CsvReconciliationUpload, PaymentReport
 from payroll.payments_registry import PaymentMethodStorage
+from payroll.permissions import ReconciliationCallbackAPIKeyPermission
+from payroll.reconciliation_callback_service import ReconciliationCallbackService
 from payroll.services import CsvReconciliationService
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,25 @@ def _resolve_send_callback_to_imis_args(request):
         raise ValueError('Rejected Bills not provided')
 
     return payroll_id, response_from_gateway, rejected_bills
+
+
+@api_view(["POST"])
+@authentication_classes([])
+@permission_classes([ReconciliationCallbackAPIKeyPermission])
+def reconciliation_callback_from_operator(request):
+    """
+    Callback push opérateur : identification (comme pull) + success + receipt/transactionId si succès.
+  """
+    try:
+        user = ReconciliationCallbackService.get_callback_user()
+        result = ReconciliationCallbackService(user).process(request.data)
+        return Response(result, status=201)
+    except ValueError as exc:
+        logger.warning("Reconciliation callback validation error: %s", exc)
+        return Response({"success": False, "error": str(exc)}, status=400)
+    except Exception as exc:
+        logger.error("Unexpected error in reconciliation callback", exc_info=exc)
+        return Response({"success": False, "error": str(exc)}, status=500)
 
 
 class CSVReconciliationAPIView(views.APIView):
