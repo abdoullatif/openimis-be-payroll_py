@@ -1,6 +1,8 @@
 import logging
+import time
 import pandas as pd
 from io import BytesIO
+import unicodedata
 
 from django.contrib.contenttypes.models import ContentType
 from django.db import transaction
@@ -323,6 +325,16 @@ class PayrollService(BaseService):
         logger.info("[Payroll] make_payment_for_payroll: queuing task for payroll_id=%s", payroll.id)
         set_payment_in_progress(payroll, self.user, True)
         payroll_id = str(payroll.id)
+        from payroll.payment_progress import (
+            clear_payroll_payment_progress_cache,
+            start_payroll_payment_progress,
+        )
+
+        clear_payroll_payment_progress_cache(payroll_id)
+        username = getattr(self.user, "login_name", None) or self.user.username
+        # Initialiser immédiatement la progression pour que le front affiche l'état "en cours"
+        # même avant la première mise à jour du worker Celery.
+        start_payroll_payment_progress(payroll_id, 0, username=username)
         user_id = self.user.id
         transaction.on_commit(
             lambda: send_requests_to_gateway_payment.delay(payroll_id, user_id)
@@ -341,11 +353,11 @@ class PayrollService(BaseService):
 
         payroll = Payroll.objects.get(id=obj_data['id'])
         reason = obj_data.get("reason") or "Payment cancelled."
+        username = getattr(self.user, "login_name", None) or self.user.username
         set_payment_in_progress(payroll, self.user, False)
         progress = cancel_payroll_payment_progress(
             str(payroll.id), reason=reason, username=username
         )
-        username = getattr(self.user, "login_name", None) or self.user.username
         persist_payment_progress_to_payroll(payroll, progress, username)
         from payroll.mutation_log_task_bar import close_stale_payroll_mutations_for_payroll
 
@@ -365,11 +377,11 @@ class PayrollService(BaseService):
 
         payroll = Payroll.objects.get(id=obj_data['id'])
         reason = obj_data.get("reason") or "Reconciliation cancelled."
+        username = getattr(self.user, "login_name", None) or self.user.username
         set_reconciliation_in_progress(payroll, self.user, False)
         progress = cancel_payroll_reconciliation_progress(
             str(payroll.id), reason=reason, username=username
         )
-        username = getattr(self.user, "login_name", None) or self.user.username
         persist_reconciliation_progress_to_payroll(payroll, progress, username)
         from payroll.mutation_log_task_bar import close_stale_payroll_mutations_for_payroll
 
@@ -668,6 +680,39 @@ class CsvReconciliationService:
     def __init__(self, user: InteractiveUser):
         self.user = user
 
+    @staticmethod
+    def _strip_accents(value):
+        if value is None:
+            return value
+        text = str(value)
+        normalized = unicodedata.normalize("NFKD", text)
+        return "".join(c for c in normalized if not unicodedata.combining(c))
+
+    def _normalize_upload_dataframe_columns(self, df):
+        """
+        En-têtes CSV (souvent sans accents après export) -> clés internes attendues par la validation.
+        """
+        df.columns = [self._strip_accents(col) for col in df.columns]
+        reverse_map = {
+            self._strip_accents(v): k
+            for k, v in PayrollConfig.csv_reconciliation_field_mapping.items()
+        }
+        df.rename(columns=reverse_map, inplace=True)
+        paid_internal = PayrollConfig.csv_reconciliation_paid_extra_field
+        paid_header = self._strip_accents(paid_internal)
+        if paid_header in df.columns and paid_header != paid_internal:
+            df.rename(columns={paid_header: paid_internal}, inplace=True)
+
+    def _display_column_names_for_export(self):
+        """Clés internes -> libellés CSV (sans accents), pour fichiers retournés à l'utilisateur."""
+        display = {
+            k: self._strip_accents(v)
+            for k, v in PayrollConfig.csv_reconciliation_field_mapping.items()
+        }
+        paid_internal = PayrollConfig.csv_reconciliation_paid_extra_field
+        display[paid_internal] = self._strip_accents(paid_internal)
+        return display
+
     def download_reconciliation(self, payroll_id) -> BytesIO:
         payroll = self._resolve_payroll(payroll_id)
         bc_qs = self._get_benefit_consumption_qs(payroll)
@@ -683,7 +728,8 @@ class CsvReconciliationService:
         # Pre-fill custom columns from best-effort sources
         prefill_code_menage = []
         prefill_numero_paie = []
-        prefill_code_empreinte = []
+        prefill_code_client = []
+        observed_schema_keys = set(extra_info_keys)
         for record in records:
             bc = benefits_by_code.get(record['code'])
             extra_info = bc.json_ext.get('extra_info', {}) if bc.json_ext else {}
@@ -691,18 +737,28 @@ class CsvReconciliationService:
             extra_info_dicts.append(extra_info)
             # code_menage: prefer extra_info, else individual.json_ext
             ind_json = bc.individual.json_ext if getattr(bc, 'individual', None) else None
+            if isinstance(ind_json, dict):
+                observed_schema_keys.update(ind_json.keys())
+            if isinstance(extra_info, dict):
+                observed_schema_keys.update(extra_info.keys())
             code_menage = extra_info.get('code_menage') if extra_info else None
             if code_menage is None and ind_json:
                 code_menage = (ind_json or {}).get('code_menage')
             prefill_code_menage.append(code_menage)
-            # numero_paie: only from provided data (no fallback to code)
+            # numero_paie: prefer extra_info, fallback to individual.json_ext.
             numero_paie = extra_info.get('numero_paie') if extra_info else None
+            if numero_paie is None and ind_json:
+                numero_paie = (ind_json or {}).get('numero_paie')
             prefill_numero_paie.append(numero_paie)
-            # code_empreinte: prefer extra_info, else individual.json_ext
-            code_empreinte = extra_info.get('code_empreinte') if extra_info else None
-            if code_empreinte is None and ind_json:
-                code_empreinte = (ind_json or {}).get('code_empreinte')
-            prefill_code_empreinte.append(code_empreinte)
+            # code_client: prefer extra_info, fallback to legacy key then individual.json_ext.
+            code_client = extra_info.get('code_client') if extra_info else None
+            if code_client is None:
+                code_client = extra_info.get('code_empreinte') if extra_info else None
+            if code_client is None and ind_json:
+                code_client = (ind_json or {}).get('code_client')
+            if code_client is None and ind_json:
+                code_client = (ind_json or {}).get('code_empreinte')
+            prefill_code_client.append(code_client)
 
         # Convert to DataFrame
         df = pd.DataFrame.from_records(records)
@@ -716,17 +772,18 @@ class CsvReconciliationService:
             lambda row: self._fill_paid_column(row), axis=1
         )
         df.rename(columns=PayrollConfig.csv_reconciliation_field_mapping, inplace=True)
+        # Suppression des accents dans les en-têtes exportés (compatibles upload)
+        df.columns = [self._strip_accents(col) for col in df.columns]
 
         # Add extra_info fields at the end of the DataFrame
         for key in extra_info_keys:
             df[key] = [extra_info_dict.get(key, None) for extra_info_dict in extra_info_dicts]
 
         # Ensure additional custom columns exist (fallback if ModuleConfiguration override)
-        _default_additional = ["code_menage", "numero_paie", "code_empreinte"]
-        try:
-            additional_columns = getattr(PayrollConfig, 'csv_reconciliation_additional_columns', None) or _default_additional
-        except Exception:
-            additional_columns = _default_additional
+        additional_columns = self._resolve_optional_additional_columns(
+            self._get_additional_columns(),
+            observed_schema_keys,
+        )
         for col in additional_columns:
             if col not in df.columns:
                 df[col] = None
@@ -735,8 +792,8 @@ class CsvReconciliationService:
             df['code_menage'] = prefill_code_menage
         if 'numero_paie' in df.columns and prefill_numero_paie:
             df['numero_paie'] = prefill_numero_paie
-        if 'code_empreinte' in df.columns and prefill_code_empreinte:
-            df['code_empreinte'] = prefill_code_empreinte
+        if 'code_client' in df.columns and prefill_code_client:
+            df['code_client'] = prefill_code_client
 
         in_memory_file = BytesIO()
         # BytesIO is duck-typed as a file object, so it can be passed to df.to_csv
@@ -754,22 +811,95 @@ class CsvReconciliationService:
         
         # Lecture uniquement CSV
         df = pd.read_csv(file)
-        
+        # Compatibilité ancienne colonne: code_empreinte -> code_client
+        if 'code_empreinte' in df.columns and 'code_client' not in df.columns:
+            df.rename(columns={'code_empreinte': 'code_client'}, inplace=True)
+
+        self._normalize_upload_dataframe_columns(df)
         self._validate_dataframe(df)
-        df.rename(columns={v: k for k, v in PayrollConfig.csv_reconciliation_field_mapping.items()}, inplace=True)
+
+        code_col = PayrollConfig.csv_reconciliation_code_column
+        codes = [c for c in df.get(code_col, pd.Series(dtype="object")).dropna().unique().tolist() if str(c).strip()]
+        benefits_by_code = {}
+        payroll_codes = set()
+        if codes:
+            benefit_qs = BenefitConsumption.objects.filter(
+                code__in=codes,
+                is_deleted=False,
+            ).select_related('individual')
+            benefits_by_code = {bc.code: bc for bc in benefit_qs}
+            payroll_codes = set(
+                BenefitConsumption.objects.filter(
+                    code__in=codes,
+                    is_deleted=False,
+                    payrollbenefitconsumption__payroll=payroll,
+                    payrollbenefitconsumption__is_deleted=False,
+                ).values_list("code", flat=True)
+            )
+
+        bills_by_benefit_id = self._prefetch_bills_by_benefit_id(
+            [b.id for b in benefits_by_code.values()]
+        )
+        from payroll.opensearch_payroll_status_sync import (
+            skip_heavy_opensearch_reindex,
+            sync_benefit_status_batch_to_opensearch,
+        )
 
         affected_rows = 0
         skipped_items = 0
         total_number_of_benefits_in_file = len(df)
+        reconciled_benefit_ids = []
+        error_values = []
+        t0 = time.perf_counter()
 
-        df[PayrollConfig.csv_reconciliation_errors_column] = df.apply(lambda row: self._reconcile_row(payroll, row),
-                                                                      axis=1)
+        payment_service = PaymentInvoiceService(self.user)
+        bill_content_type = ContentType.objects.get_for_model(Bill)
 
-        for _, row in df.iterrows():
-            if not pd.isna(row[PayrollConfig.csv_reconciliation_errors_column]):
-                skipped_items += 1
-            else:
-                affected_rows += 1
+        with skip_heavy_opensearch_reindex():
+            for idx in range(len(df)):
+                row = df.iloc[idx]
+                errors, bc = self._validate_reconciliation_row(
+                    payroll, row, benefits_by_code, payroll_codes
+                )
+                if (
+                    not errors
+                    and bc
+                    and self._should_apply_csv_reconciliation(row, bc)
+                ):
+                    self._apply_csv_reconciliation_row(
+                        row,
+                        bc,
+                        bill=bills_by_benefit_id.get(bc.id),
+                        payment_service=payment_service,
+                        bill_content_type=bill_content_type,
+                    )
+                    reconciled_benefit_ids.append(bc.id)
+                error_values.append(errors)
+                if errors:
+                    skipped_items += 1
+                else:
+                    affected_rows += 1
+
+            if reconciled_benefit_ids:
+                os_batch = 500
+                for offset in range(0, len(reconciled_benefit_ids), os_batch):
+                    sync_benefit_status_batch_to_opensearch(
+                        payroll.id,
+                        reconciled_benefit_ids[offset : offset + os_batch],
+                        BenefitConsumptionStatus.RECONCILED,
+                    )
+
+        elapsed = time.perf_counter() - t0
+        logger.info(
+            "CSV reconciliation upload payroll_id=%s rows=%s reconciled=%s skipped=%s elapsed=%.2fs",
+            payroll_id,
+            total_number_of_benefits_in_file,
+            len(reconciled_benefit_ids),
+            skipped_items,
+            elapsed,
+        )
+
+        df[PayrollConfig.csv_reconciliation_errors_column] = error_values
 
         summary = {
             'affected_rows': affected_rows,
@@ -780,7 +910,7 @@ class CsvReconciliationService:
         error_df = df[df[PayrollConfig.csv_reconciliation_errors_column].apply(lambda x: bool(x))]
         if not error_df.empty:
             in_memory_file = BytesIO()
-            df.rename(columns={k: v for k, v in PayrollConfig.csv_reconciliation_field_mapping.items()}, inplace=True)
+            df.rename(columns=self._display_column_names_for_export(), inplace=True)
             df.to_csv(in_memory_file, index=False)
             return in_memory_file, error_df.set_index(PayrollConfig.csv_reconciliation_code_column)\
                                    [PayrollConfig.csv_reconciliation_errors_column].to_dict(), summary
@@ -799,8 +929,9 @@ class CsvReconciliationService:
             raise ValueError(_("Import file is empty"))
         if PayrollConfig.csv_reconciliation_errors_column in df.columns:
             raise ValueError(_("Column errors in csv."))
-        if 'Status' in df.columns:
-            if (df[PayrollConfig.csv_reconciliation_status_column] == BenefitConsumptionStatus.RECONCILED).all():
+        status_col = "status"
+        if status_col in df.columns:
+            if (df[status_col] == BenefitConsumptionStatus.RECONCILED).all():
                 raise ValueError(_("All of the Benefit Consumptions have been already reconciled."))
 
     def _fill_paid_column(self, row):
@@ -819,11 +950,68 @@ class CsvReconciliationService:
         return payroll
 
     def _get_additional_columns(self):
-        _default = ["code_menage", "numero_paie", "code_empreinte"]
+        _default = ["code_menage", "numero_paie", "code_client"]
         try:
-            return getattr(PayrollConfig, 'csv_reconciliation_additional_columns', None) or _default
+            cols = getattr(PayrollConfig, 'csv_reconciliation_additional_columns', None) or _default
         except Exception:
-            return _default
+            cols = _default
+        normalized = []
+        for col in cols:
+            if col == "code_empreinte":
+                col = "code_client"
+            if col not in normalized:
+                normalized.append(col)
+        return normalized
+
+    def _resolve_optional_additional_columns(self, columns, observed_schema_keys):
+        """
+        Ajoute code_client / numero_paie uniquement s'ils existent dans le schéma de données
+        (keys observées dans individual.json_ext ou benefit.json_ext.extra_info).
+        """
+        cols = list(columns or [])
+        schema_keys = set(observed_schema_keys or set())
+        if "numero_paie" in cols and "numero_paie" not in schema_keys:
+            cols.remove("numero_paie")
+        code_client_keys = {"code_client", "code_empreinte"}
+        if "code_client" in cols and not (schema_keys & code_client_keys):
+            cols.remove("code_client")
+        return cols
+
+    def _prefetch_bills_by_benefit_id(self, benefit_ids):
+        if not benefit_ids:
+            return {}
+        bills_by_benefit_id = {}
+        attachments = BenefitAttachment.objects.filter(
+            benefit_id__in=benefit_ids,
+            is_deleted=False,
+        ).select_related("bill")
+        for attachment in attachments:
+            if attachment.benefit_id not in bills_by_benefit_id and attachment.bill_id:
+                bills_by_benefit_id[attachment.benefit_id] = attachment.bill
+        return bills_by_benefit_id
+
+    @staticmethod
+    def _normalize_paid_value(row):
+        paid_val = row[PayrollConfig.csv_reconciliation_paid_extra_field]
+        if pd.isna(paid_val):
+            return None
+        text = str(paid_val).strip()
+        return text or None
+
+    @staticmethod
+    def _normalize_receipt_value(row):
+        receipt_val = row[PayrollConfig.csv_reconciliation_receipt_column]
+        if pd.isna(receipt_val):
+            return None
+        text = str(receipt_val).strip()
+        return text or None
+
+    def _should_apply_csv_reconciliation(self, row, bc):
+        paid_val = self._normalize_paid_value(row)
+        return (
+            paid_val == PayrollConfig.csv_reconciliation_paid_yes
+            and bc.status == BenefitConsumptionStatus.ACCEPTED
+        )
 
     def _validate_additional_columns(self, row, bc, errors):
         """Valide le format et la cohérence des colonnes additionnelles."""
@@ -861,21 +1049,26 @@ class CsvReconciliationService:
                     % {'column': col, 'max': max_length}
                 )
 
-    def _reconcile_row(self, payroll, row):
+    def _validate_reconciliation_row(self, payroll, row, benefits_by_code=None, payroll_codes=None):
         errors = []
-        bc = BenefitConsumption.objects.filter(
-            code=row['code'], is_deleted=False
-        ).select_related('individual').first()
+        code_value = row[PayrollConfig.csv_reconciliation_code_column]
+        code_value = str(code_value).strip() if not pd.isna(code_value) else None
+        bc = (benefits_by_code or {}).get(code_value)
+        if bc is None and code_value:
+            bc = BenefitConsumption.objects.filter(
+                code=code_value, is_deleted=False
+            ).select_related('individual').first()
         if not bc:
             errors.append(_('benefit_consumption_not_found'))
-        if bc and not bc.payrollbenefitconsumption_set.filter(payroll=payroll).exists():
+        if bc and payroll_codes is not None and code_value not in payroll_codes:
             errors.append(_('benefit_consumption_not_in_payroll'))
-        if (row[PayrollConfig.csv_reconciliation_paid_extra_field]
-                and row[PayrollConfig.csv_reconciliation_paid_extra_field]
-                not in [PayrollConfig.csv_reconciliation_paid_yes, PayrollConfig.csv_reconciliation_paid_no]):
+        elif bc and payroll_codes is None and not bc.payrollbenefitconsumption_set.filter(payroll=payroll).exists():
+            errors.append(_('benefit_consumption_not_in_payroll'))
+        paid_val = self._normalize_paid_value(row)
+        if paid_val and paid_val not in [PayrollConfig.csv_reconciliation_paid_yes, PayrollConfig.csv_reconciliation_paid_no]:
             errors.append(_('paid_column_invalid_value'))
 
-        if not row[PayrollConfig.csv_reconciliation_receipt_column]:
+        if paid_val == PayrollConfig.csv_reconciliation_paid_yes and not self._normalize_receipt_value(row):
             errors.append(_('receipt_required'))
 
         if bc and bc.status != row['status']:
@@ -883,17 +1076,37 @@ class CsvReconciliationService:
 
         self._validate_additional_columns(row, bc, errors)
 
-        if (not errors
-                and bc
-                and (row[PayrollConfig.csv_reconciliation_paid_extra_field] == PayrollConfig.csv_reconciliation_paid_yes
-                     and bc.status == BenefitConsumptionStatus.ACCEPTED)):
-            self._reconcile_bc(row, bc)
+        return (errors if errors else None), bc
 
-        return errors if errors else None
+    def _reconcile_row(self, payroll, row, benefits_by_code=None, payroll_codes=None):
+        """Compatibilité tests / appels directs : validation seule."""
+        errors, _bc = self._validate_reconciliation_row(
+            payroll, row, benefits_by_code, payroll_codes
+        )
+        return errors
 
-    def _reconcile_bc(self, row, bc):
+    def _apply_csv_reconciliation_row(
+        self,
+        row,
+        bc,
+        *,
+        bill=None,
+        payment_service=None,
+        bill_content_type=None,
+    ):
+        self._reconcile_bc(
+            row,
+            bc,
+            bill=bill,
+            payment_service=payment_service,
+            bill_content_type=bill_content_type,
+        )
+
+    def _reconcile_bc(self, row, bc, *, bill=None, payment_service=None, bill_content_type=None):
+        from payroll.opensearch_payroll_status_sync import benefit_status_only_save
+
         bc.status = BenefitConsumptionStatus.RECONCILED
-        bc.receipt = row[PayrollConfig.csv_reconciliation_receipt_column]
+        bc.receipt = self._normalize_receipt_value(row)
         excluded = set(PayrollConfig.csv_reconciliation_field_mapping)
         excluded.add(PayrollConfig.csv_reconciliation_errors_column)
         extra_info = {
@@ -901,16 +1114,25 @@ class CsvReconciliationService:
             if k not in excluded and not pd.isna(row[k]) and str(row[k]).strip()
         }
         bc.json_ext = {'extra_info': extra_info}
-        bc.save(username=self.user.login_name)
-        bill = Bill.objects.filter(benefitattachment__benefit=bc, is_deleted=False).first()
+        benefit_status_only_save(bc, self.user.login_name)
+        if bill is None:
+            bill = Bill.objects.filter(benefitattachment__benefit=bc, is_deleted=False).first()
         if bill:
-            self._reconcile_bill(row, bill)
+            self._reconcile_bill(
+                row,
+                bill,
+                payment_service=payment_service,
+                bill_content_type=bill_content_type,
+            )
 
-    def _reconcile_bill(self, row, bill):
+    def _reconcile_bill(self, row, bill, *, payment_service=None, bill_content_type=None):
         current_date = datetime.date.today()
         bill.status = Bill.Status.RECONCILIATED
         bill.date_payed = current_date
-        bill.save(username=self.user.login_name)
+        from payroll.opensearch_payroll_status_sync import skip_heavy_opensearch_reindex
+
+        with skip_heavy_opensearch_reindex():
+            bill.save(username=self.user.login_name)
 
         bill_payment = {
             "code_tp": bill.code_tp,
@@ -928,14 +1150,14 @@ class CsvReconciliationService:
         }
 
         bill_payment_details = {
-            'subject_type': ContentType.objects.get_for_model(bill),
+            'subject_type': bill_content_type or ContentType.objects.get_for_model(bill),
             'subject': bill,
             'status': DetailPaymentInvoice.DetailPaymentStatus.ACCEPTED,
             'fees': 0.0,
             'amount': bill.amount_total,
-            'reconcilation_id': row[PayrollConfig.csv_reconciliation_receipt_column],
+            'reconcilation_id': self._normalize_receipt_value(row),
             'reconcilation_date': current_date,
         }
         bill_payment_details = DetailPaymentInvoice(**bill_payment_details)
-        payment_service = PaymentInvoiceService(self.user)
-        payment_service.create_with_detail(bill_payment, bill_payment_details)
+        service = payment_service or PaymentInvoiceService(self.user)
+        service.create_with_detail(bill_payment, bill_payment_details)

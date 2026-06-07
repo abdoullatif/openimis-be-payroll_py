@@ -1,10 +1,13 @@
 """Verrouillage et indicateurs d'avancement réconciliation / paiement."""
 
 from django.contrib.contenttypes.models import ContentType
+import logging
 
 from payroll.apps import PayrollConfig
 from payroll.models import Payroll
 from tasks_management.models import Task
+
+logger = logging.getLogger(__name__)
 
 RECONCILIATION_IN_PROGRESS_KEY = "reconciliation_in_progress"
 PAYMENT_IN_PROGRESS_KEY = "payment_in_progress"
@@ -85,3 +88,9 @@ def set_payment_in_progress(payroll, user, in_progress):
         json_ext.pop(PAYMENT_IN_PROGRESS_KEY, None)
     payroll.json_ext = json_ext
     _save_payroll_json_ext_flags(payroll, user)
+    logger.info(
+        "[reconciliation_lock] set_payment_in_progress payroll_id=%s in_progress=%s by=%s",
+        payroll.id,
+        in_progress,
+        _username(user),
+    )

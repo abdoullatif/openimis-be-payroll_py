@@ -1,15 +1,20 @@
 """Suivi de progression paiement passerelle (tâche Celery, cache + json_ext)."""
 
 from datetime import datetime, timedelta
+import logging
 
 from django.core.cache import cache
 from django.utils import timezone
+
+logger = logging.getLogger(__name__)
 
 CACHE_KEY_PREFIX = "payroll_payment_progress:"
 # Paiements massifs (>100k) : cache et seuil STALE alignés sur des jobs de plusieurs heures.
 CACHE_TIMEOUT_SECONDS = 86400
 PROGRESS_UPDATE_INTERVAL = 50
 STALE_PAYMENT_PROGRESS_MINUTES = 480
+# Worker Celery tué / plus de mises à jour : libérer le verrou plus tôt.
+PAYMENT_WORKER_STALE_MINUTES = 3
 
 STATUS_IN_PROGRESS = "IN_PROGRESS"
 STATUS_COMPLETED = "COMPLETED"
@@ -86,6 +91,12 @@ def start_payroll_payment_progress(payroll_id, total_beneficiaries, username=Non
     )
     cache.set(_cache_key(payroll_id), payload, CACHE_TIMEOUT_SECONDS)
     _snapshot_progress_to_payroll(payroll_id, payload, username)
+    logger.info(
+        "[payment_progress] start payroll_id=%s total=%s username=%s",
+        payroll_id,
+        total_beneficiaries,
+        username,
+    )
     return payload
 
 
@@ -125,6 +136,14 @@ def update_payroll_payment_progress(
     )
     cache.set(_cache_key(payroll_id), payload, CACHE_TIMEOUT_SECONDS)
     _snapshot_progress_to_payroll(payroll_id, payload, username)
+    logger.info(
+        "[payment_progress] update payroll_id=%s processed=%s/%s success=%s rejected=%s",
+        payroll_id,
+        processed,
+        total,
+        success_count,
+        rejected_count,
+    )
     return payload
 
 
@@ -154,6 +173,14 @@ def complete_payroll_payment_progress(
     }
     cache.set(_cache_key(payroll_id), payload, CACHE_TIMEOUT_SECONDS)
     _snapshot_progress_to_payroll(payroll_id, payload, username)
+    logger.info(
+        "[payment_progress] complete payroll_id=%s processed=%s/%s success=%s rejected=%s",
+        payroll_id,
+        processed,
+        total,
+        success_count,
+        rejected_count,
+    )
     return payload
 
 
@@ -176,6 +203,11 @@ def fail_payroll_payment_progress(payroll_id, error_message, username=None):
     }
     cache.set(_cache_key(payroll_id), payload, CACHE_TIMEOUT_SECONDS)
     _snapshot_progress_to_payroll(payroll_id, payload, username)
+    logger.warning(
+        "[payment_progress] fail payroll_id=%s error=%s",
+        payroll_id,
+        error_message,
+    )
     return payload
 
 
@@ -199,13 +231,36 @@ def _parse_progress_timestamp(value):
         return None
 
 
-def _is_stale_payment_progress(payload):
+def _is_stale_payment_progress(payload, *, minutes=None):
     """Inactivité (dernière mise à jour), pas seulement la durée depuis le démarrage."""
     reference_at = payload.get("updated_at") or payload.get("started_at")
     reference = _parse_progress_timestamp(reference_at)
     if not reference:
         return False
-    return datetime.now() - reference > timedelta(minutes=STALE_PAYMENT_PROGRESS_MINUTES)
+    limit = minutes if minutes is not None else STALE_PAYMENT_PROGRESS_MINUTES
+    return datetime.now() - reference > timedelta(minutes=limit)
+
+
+def _is_payment_recently_updated(payload, minutes=PAYMENT_WORKER_STALE_MINUTES):
+    reference_at = payload.get("updated_at") or payload.get("started_at")
+    reference = _parse_progress_timestamp(reference_at)
+    if not reference:
+        return False
+    return datetime.now() - reference <= timedelta(minutes=minutes)
+
+
+def _release_payment_in_progress_lock(payroll):
+    from payroll.reconciliation_lock import set_payment_in_progress
+
+    user = getattr(payroll, "user_updated", None) or getattr(payroll, "user_created", None)
+    if user:
+        set_payment_in_progress(payroll, user, False)
+        return
+
+    class _FallbackUser:
+        username = "Admin"
+
+    set_payment_in_progress(payroll, _FallbackUser(), False)
 
 
 def _recover_active_payment_progress(payroll, payload):
@@ -223,7 +278,12 @@ def _recover_active_payment_progress(payroll, payload):
     recovered["message"] = None
     recovered["updated_at"] = timezone.now().isoformat()
     cache.set(_cache_key(payroll_id), recovered, CACHE_TIMEOUT_SECONDS)
-    persist_payment_progress_to_payroll(payroll, recovered, "System")
+    username = (
+        getattr(getattr(payroll, "user_updated", None), "username", None)
+        or getattr(getattr(payroll, "user_created", None), "username", None)
+        or "Admin"
+    )
+    persist_payment_progress_to_payroll(payroll, recovered, username)
     return recovered
 
 
@@ -247,6 +307,11 @@ def cancel_payroll_payment_progress(payroll_id, reason=None, username=None):
     }
     cache.set(_cache_key(payroll_id), payload, CACHE_TIMEOUT_SECONDS)
     _snapshot_progress_to_payroll(payroll_id, payload, username)
+    logger.warning(
+        "[payment_progress] cancel payroll_id=%s reason=%s",
+        payroll_id,
+        reason,
+    )
     return payload
 
 
@@ -278,15 +343,37 @@ def reconcile_payment_progress_for_payroll(payroll):
         payload = {}
 
     status = payload.get("status")
+    logger.info(
+        "[payment_progress] resolve payroll_id=%s status=%s flag_active=%s updated_at=%s",
+        payroll_id,
+        status,
+        flag_active,
+        payload.get("updated_at"),
+    )
     if status in TERMINAL_STATUSES:
-        if status == STATUS_STALE and flag_active:
+        if flag_active and status == STATUS_STALE and _is_payment_recently_updated(payload):
             return _recover_active_payment_progress(payroll, payload)
+        if flag_active and status in (STATUS_STALE, STATUS_CANCELLED):
+            _release_payment_in_progress_lock(payroll)
         result = dict(payload)
         result["should_stop_polling"] = True
         return result
 
     if status == STATUS_IN_PROGRESS:
+        if flag_active and _is_stale_payment_progress(
+            payload, minutes=PAYMENT_WORKER_STALE_MINUTES
+        ):
+            _release_payment_in_progress_lock(payroll)
+            return cancel_payroll_payment_progress(
+                payroll_id,
+                "Payment interrupted. The worker may have been stopped. You can start a new payment.",
+            )
         if not flag_active:
+            # Progression récente : mutation / Celery pas encore flagués (polling trop tôt).
+            if not _is_stale_payment_progress(payload):
+                result = dict(payload)
+                result["should_stop_polling"] = False
+                return result
             return cancel_payroll_payment_progress(
                 payroll_id, "Payment cancelled or job interrupted."
             )

@@ -3,6 +3,7 @@ import graphene_django_optimizer as gql_optimizer
 from gettext import gettext as _
 from django.contrib.auth.models import AnonymousUser
 from django.db.models import Q, Sum
+import logging
 
 from core.schema import OrderedDjangoFilterConnectionField
 from core.services import wait_for_mutation
@@ -27,6 +28,8 @@ from payroll.models import PaymentPoint, Payroll, \
     CsvReconciliationUpload, PayrollBenefitConsumption, BenefitConsumptionStatus
 from payroll.payments_registry import PaymentMethodStorage
 from social_protection.models import BenefitPlan
+
+logger = logging.getLogger(__name__)
 
 
 class PayrollConnectionField(OrderedDjangoFilterConnectionField):
@@ -170,7 +173,14 @@ class Query(graphene.ObjectType):
         payroll = Payroll.objects.filter(id=payroll_id, is_deleted=False).first()
         if not payroll:
             return None
-        return reconcile_payment_progress_for_payroll(payroll)
+        progress = reconcile_payment_progress_for_payroll(payroll)
+        logger.info(
+            "[gql] resolve_payroll_payment_progress payroll_id=%s status=%s should_stop=%s",
+            payroll_id,
+            (progress or {}).get("status"),
+            (progress or {}).get("should_stop_polling"),
+        )
+        return progress
 
     def resolve_payroll_reconciliation_progress(self, info, payroll_id):
         from payroll.reconciliation_progress import reconcile_reconciliation_progress_for_payroll

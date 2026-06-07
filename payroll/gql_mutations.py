@@ -3,6 +3,7 @@ from gettext import gettext as _
 from django.contrib.auth.models import AnonymousUser
 from django.core.exceptions import ValidationError
 from django.db import transaction
+import logging
 
 from core.gql.gql_mutations.base_mutation import BaseHistoryModelCreateMutationMixin, BaseMutation, \
     BaseHistoryModelUpdateMutationMixin, BaseHistoryModelDeleteMutationMixin
@@ -10,6 +11,8 @@ from core.schema import OpenIMISMutation
 from payroll.apps import PayrollConfig
 from payroll.models import PaymentPoint, Payroll, PayrollStatus, PayrollMutation
 from payroll.services import PaymentPointService, PayrollService, BenefitConsumptionService
+
+logger = logging.getLogger(__name__)
 
 
 class CreatePaymentPointInputType(OpenIMISMutation.Input):
@@ -333,6 +336,7 @@ class MakePaymentForPayrollMutation(BaseHistoryModelDeleteMutationMixin, BaseMut
 
     @classmethod
     def _mutate(cls, user, **data):
+        client_mutation_id = data.get("client_mutation_id")
         if "client_mutation_id" in data:
             data.pop('client_mutation_id')
         if "client_mutation_label" in data:
@@ -340,6 +344,12 @@ class MakePaymentForPayrollMutation(BaseHistoryModelDeleteMutationMixin, BaseMut
 
         service = PayrollService(user)
         ids = data.get('ids')
+        logger.info(
+            "[gql] makePaymentForPayroll request ids=%s clientMutationId=%s user=%s",
+            ids,
+            client_mutation_id,
+            getattr(user, "username", None),
+        )
         if ids:
             with transaction.atomic():
                 for id in ids:

@@ -61,7 +61,7 @@ DEFAULT_CONFIG = {
     "csv_reconciliation_additional_columns": [
         "code_menage",
         "numero_paie",
-        "code_empreinte",
+        "code_client",
     ],
     "payroll_delete_event": "payroll.payroll_delete",
     "benefit_delete_event": "payroll.benefit_delete",
