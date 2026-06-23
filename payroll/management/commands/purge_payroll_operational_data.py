@@ -158,7 +158,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--skip-opensearch",
             action="store_true",
-            help="Ne pas supprimer les documents OpenSearch (purge DB uniquement).",
+            help="Ne pas supprimer les documents OpenSearch (purge DB uniquement, sans sync OS)."
         )
         parser.add_argument(
             "--opensearch-only",
@@ -214,7 +214,13 @@ class Command(BaseCommand):
 
         with transaction.atomic():
             self._unlock_payrolls(user)
-            deleted = self._purge(stats)
+            if options["skip_opensearch"]:
+                from payroll.opensearch_payroll_status_sync import skip_heavy_opensearch_reindex
+
+                with skip_heavy_opensearch_reindex():
+                    deleted = self._purge(stats)
+            else:
+                deleted = self._purge(stats)
         if not options["skip_redis"]:
             n = _clear_payroll_redis_keys(self.stdout, self.style)
             self.stdout.write(self.style.SUCCESS(f"Clés Redis supprimées : {n}"))
