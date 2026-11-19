@@ -225,8 +225,12 @@ def reconcile_reconciliation_progress_for_payroll(payroll):
 
     payroll_id = str(payroll.id)
     flag_active = is_reconciliation_in_progress(payroll)
-    payload = get_payroll_reconciliation_progress(payroll_id) or (payroll.json_ext or {}).get(
-        "reconciliation_progress"
+    from payroll.payment_progress import prefer_fresher_payment_progress
+
+    db_payload = (payroll.json_ext or {}).get("reconciliation_progress")
+    payload = prefer_fresher_payment_progress(
+        get_payroll_reconciliation_progress(payroll_id),
+        db_payload if isinstance(db_payload, dict) else None,
     )
 
     if not payload:

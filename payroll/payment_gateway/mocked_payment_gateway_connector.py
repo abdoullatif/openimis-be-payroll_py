@@ -14,13 +14,15 @@ class MockedPaymentGatewayConnector(PaymentGatewayConnector):
     def send_payment(self, invoice_id, amount, **kwargs):
         projet = kwargs.get("projet")
         campagne = kwargs.get("campagne")
-        code_menage = kwargs.get("code_menage")
+        id_ben_principal = kwargs.get("id_ben_principal")
+        if id_ben_principal is None:
+            id_ben_principal = kwargs.get("code_menage")  # compat ancienne signature
         payload = {
             "invoiceId": str(invoice_id),
             "amount": str(amount),
             "projet": str(projet) if projet is not None else "",
             "campagne": str(campagne) if campagne is not None else "",
-            "codeMenage": str(code_menage) if code_menage is not None else "",
+            "id_ben_principal": str(id_ben_principal) if id_ben_principal is not None else "",
         }
         #logger.info("[Passerelle] Envoi paiement payload=%s", payload)
         response = self.send_request(self.config.endpoint_payment, payload)
@@ -65,12 +67,15 @@ class MockedPaymentGatewayConnector(PaymentGatewayConnector):
         return False
 
     def reconcile(self, invoice_id, amount, **kwargs):
+        id_ben_principal = kwargs.get("id_ben_principal")
+        if id_ben_principal is None:
+            id_ben_principal = kwargs.get("code_menage")
         payload = build_reconciliation_payload(
             invoice_id,
             amount,
             projet=kwargs.get("projet"),
             campagne=kwargs.get("campagne"),
-            code_menage=kwargs.get("code_menage"),
+            id_ben_principal=id_ben_principal,
         )
         response = self.send_request(self.config.endpoint_reconciliation, payload)
         if response:

@@ -2,6 +2,7 @@ import logging
 from decimal import Decimal, InvalidOperation
 
 from core.models import User
+from payroll.apps import PayrollConfig
 from payroll.models import BenefitConsumption, BenefitConsumptionStatus
 from payroll.payments_registry import PaymentMethodStorage
 from payroll.reconciliation_benefit_utils import merge_benefit_json_ext, save_benefit_if_dirty
@@ -54,6 +55,8 @@ class ReconciliationCallbackService:
         self._validate_context(benefit, payroll, payload)
 
         if benefit.status == BenefitConsumptionStatus.RECONCILED:
+            # Idempotent sur le statut, mais on peut quand même synchroniser numero_paie.
+            self._sync_numero_paie(benefit, payload)
             return self._build_response(
                 benefit, payroll, payload,
                 already_reconciled=True,
@@ -66,9 +69,34 @@ class ReconciliationCallbackService:
             )
 
         if not payload["success"]:
-            return self._record_reconciliation_failure(benefit, payroll, payload)
+            result = self._record_reconciliation_failure(benefit, payroll, payload)
+            self._notify_operator_callback_session(
+                payroll, success=False, already_reconciled=False
+            )
+            return result
 
-        return self._record_reconciliation_success(benefit, payroll, payload)
+        result = self._record_reconciliation_success(benefit, payroll, payload)
+        self._notify_operator_callback_session(
+            payroll, success=True, already_reconciled=False
+        )
+        return result
+
+    def _notify_operator_callback_session(self, payroll, *, success, already_reconciled):
+        try:
+            from payroll.notifications import on_operator_callback_processed
+
+            username = getattr(self.user, "login_name", None) or self.user.username
+            on_operator_callback_processed(
+                payroll,
+                success=success,
+                already_reconciled=already_reconciled,
+                username=username,
+            )
+        except Exception:
+            logger.exception(
+                "[Reconciliation callback] notification failed payroll_id=%s",
+                getattr(payroll, "id", None),
+            )
 
     def _record_reconciliation_failure(self, benefit, payroll, payload):
         username = getattr(self.user, "login_name", None) or self.user.username
@@ -111,6 +139,7 @@ class ReconciliationCallbackService:
             operator_receipts={benefit.code: operator_receipt},
         )
         benefit.refresh_from_db()
+        self._sync_numero_paie(benefit, payload)
 
         logger.info(
             "[Reconciliation callback] success invoiceId=%s payroll_id=%s receipt=%s",
@@ -123,6 +152,30 @@ class ReconciliationCallbackService:
             already_reconciled=False,
             recorded=True,
         )
+
+    def _sync_numero_paie(self, benefit, payload):
+        numero_paie = payload.get("numero_paie")
+        if not numero_paie:
+            return
+        try:
+            from payroll.numero_paie_sync import (
+                SOURCE_OPERATOR_CALLBACK,
+                sync_numero_paie_from_operator,
+            )
+
+            username = getattr(self.user, "login_name", None) or self.user.username
+            sync_numero_paie_from_operator(
+                benefit,
+                numero_paie,
+                source=SOURCE_OPERATOR_CALLBACK,
+                username=username,
+                invoice_id=benefit.code,
+            )
+        except Exception:
+            logger.exception(
+                "[Reconciliation callback] numero_paie sync failed invoiceId=%s",
+                getattr(benefit, "code", None),
+            )
 
     def _ensure_online_payment_payroll(self, payroll):
         if payroll.payment_method != StrategyOnlinePayment.__name__:
@@ -145,9 +198,13 @@ class ReconciliationCallbackService:
             raise ValueError("projet does not match payroll context")
         if payload["campagne"] and campagne and str(campagne) != payload["campagne"]:
             raise ValueError("campagne does not match payroll context")
-        code_menage = StrategyOnlinePayment._get_code_menage(benefit)
-        if payload["codeMenage"] and code_menage and str(code_menage) != payload["codeMenage"]:
-            raise ValueError("codeMenage does not match benefit context")
+        id_ben_principal = StrategyOnlinePayment._get_id_ben_principal(benefit)
+        if (
+            payload.get("id_ben_principal")
+            and id_ben_principal
+            and str(id_ben_principal) != payload["id_ben_principal"]
+        ):
+            raise ValueError("id_ben_principal does not match benefit context")
 
     def _build_response(self, benefit, payroll, payload, already_reconciled, recorded):
         operator_success = payload.get("success", True)

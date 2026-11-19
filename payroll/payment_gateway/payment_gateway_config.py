@@ -8,6 +8,7 @@ class PaymentGatewayConfig:
         self.gateway_base_url = PayrollConfig.gateway_base_url
         self.endpoint_payment = PayrollConfig.endpoint_payment
         self.endpoint_reconciliation = PayrollConfig.endpoint_reconciliation
+        self.endpoint_beneficiary = PayrollConfig.endpoint_beneficiary
         self.api_key = PayrollConfig.payment_gateway_api_key
         self.basic_auth_username = PayrollConfig.payment_gateway_basic_auth_username
         self.basic_auth_password = PayrollConfig.payment_gateway_basic_auth_password
@@ -44,3 +45,6 @@ class PaymentGatewayConfig:
 
     def get_reconciliation_endpoint(self):
         return self.endpoint_reconciliation
+
+    def get_beneficiary_endpoint(self):
+        return self.endpoint_beneficiary

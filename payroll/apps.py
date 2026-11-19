@@ -58,10 +58,26 @@ DEFAULT_CONFIG = {
     "csv_reconciliation_paid_yes": "Oui",
     "csv_reconciliation_paid_no": "Non",
     # Additional custom columns (noms internes, utilisés dans services.py)
+    # region / prefecture / sous_prefecture / district / id_ben_principal :
+    # lus depuis json_ext (pas Locality), contrôle strict à l'upload.
     "csv_reconciliation_additional_columns": [
+        "region",
+        "prefecture",
+        "sous_prefecture",
+        "district",
+        "id_ben_principal",
         "code_menage",
         "numero_paie",
         "code_client",
+    ],
+    # Colonnes additionnelles toujours exportées + matchées strictement vs individual.json_ext
+    "csv_reconciliation_strict_json_ext_columns": [
+        "region",
+        "prefecture",
+        "sous_prefecture",
+        "district",
+        "id_ben_principal",
+        "code_menage",
     ],
     "payroll_delete_event": "payroll.payroll_delete",
     "benefit_delete_event": "payroll.benefit_delete",
@@ -70,6 +86,7 @@ DEFAULT_CONFIG = {
     "gateway_base_url": os.getenv("PAYMENT_GATEWAY_BASE_URL", "http://41.175.18.170:8070/api/mobile/v1/"),
     "endpoint_payment": os.getenv("ENDPOINT_PAYMENT", "mock/payment"),
     "endpoint_reconciliation": os.getenv("ENDPOINT_RECONCILIATION", "mock/reconciliation"),
+    "endpoint_beneficiary": os.getenv("ENDPOINT_BENEFICIARY", "Beneficiary/sync"),
     "payment_gateway_api_key": os.getenv("PAYMENT_GATEWAY_API_KEY"),
     "payment_gateway_basic_auth_username": os.getenv("PAYMENT_GATEWAY_BASIC_AUTH_USERNAME"),
     "payment_gateway_basic_auth_password": os.getenv("PAYMENT_GATEWAY_BASIC_AUTH_PASSWORD"),
@@ -109,12 +126,15 @@ class PayrollConfig(AppConfig):
     csv_reconciliation_code_column = None
     csv_reconciliation_paid_yes = None
     csv_reconciliation_paid_no = None
+    csv_reconciliation_additional_columns = None
+    csv_reconciliation_strict_json_ext_columns = None
     payroll_delete_event = None
     benefit_delete_event = None
 
     gateway_base_url = None
     endpoint_payment = None
     endpoint_reconciliation = None
+    endpoint_beneficiary = None
     payment_gateway_api_key = None
     payment_gateway_basic_auth_username = None
     payment_gateway_basic_auth_password = None

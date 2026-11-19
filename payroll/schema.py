@@ -175,9 +175,14 @@ class Query(graphene.ObjectType):
             return None
         progress = reconcile_payment_progress_for_payroll(payroll)
         logger.info(
-            "[gql] resolve_payroll_payment_progress payroll_id=%s status=%s should_stop=%s",
+            "[gql] resolve_payroll_payment_progress payroll_id=%s status=%s "
+            "processed=%s/%s success=%s rejected=%s should_stop=%s",
             payroll_id,
             (progress or {}).get("status"),
+            (progress or {}).get("processed_beneficiaries"),
+            (progress or {}).get("total_beneficiaries"),
+            (progress or {}).get("success_count"),
+            (progress or {}).get("rejected_count"),
             (progress or {}).get("should_stop_polling"),
         )
         return progress

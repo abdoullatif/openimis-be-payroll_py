@@ -332,9 +332,12 @@ class PayrollService(BaseService):
 
         clear_payroll_payment_progress_cache(payroll_id)
         username = getattr(self.user, "login_name", None) or self.user.username
-        # Initialiser immédiatement la progression pour que le front affiche l'état "en cours"
-        # même avant la première mise à jour du worker Celery.
-        start_payroll_payment_progress(payroll_id, 0, username=username)
+        # Compter les factures encore ACCEPTED pour éviter l'affichage trompeur 0/0
+        # avant que Celery ne démarre (le total exact sera recalculé dans le worker).
+        remaining = StrategyOnlinePayment.get_benefits_attached_to_payroll(
+            payroll, BenefitConsumptionStatus.ACCEPTED
+        ).count()
+        start_payroll_payment_progress(payroll_id, remaining, username=username)
         user_id = self.user.id
         transaction.on_commit(
             lambda: send_requests_to_gateway_payment.delay(payroll_id, user_id)
@@ -350,11 +353,12 @@ class PayrollService(BaseService):
             cancel_payroll_payment_progress,
             persist_payment_progress_to_payroll,
         )
+        from payroll.reconciliation_lock import request_payment_stop
 
         payroll = Payroll.objects.get(id=obj_data['id'])
         reason = obj_data.get("reason") or "Payment cancelled."
         username = getattr(self.user, "login_name", None) or self.user.username
-        set_payment_in_progress(payroll, self.user, False)
+        request_payment_stop(payroll, self.user)
         progress = cancel_payroll_payment_progress(
             str(payroll.id), reason=reason, username=username
         )
@@ -375,10 +379,12 @@ class PayrollService(BaseService):
             persist_reconciliation_progress_to_payroll,
         )
 
+        from payroll.reconciliation_lock import request_reconciliation_stop
+
         payroll = Payroll.objects.get(id=obj_data['id'])
         reason = obj_data.get("reason") or "Reconciliation cancelled."
         username = getattr(self.user, "login_name", None) or self.user.username
-        set_reconciliation_in_progress(payroll, self.user, False)
+        request_reconciliation_stop(payroll, self.user)
         progress = cancel_payroll_reconciliation_progress(
             str(payroll.id), reason=reason, username=username
         )
@@ -400,6 +406,17 @@ class PayrollService(BaseService):
         logger.info("[Payroll] trigger_payroll_reconciliation: queuing task for payroll_id=%s", payroll.id)
         set_reconciliation_in_progress(payroll, self.user, True)
         payroll_id = str(payroll.id)
+        username = getattr(self.user, "login_name", None) or self.user.username
+        from payroll.reconciliation_progress import (
+            clear_payroll_reconciliation_progress_cache,
+            start_payroll_reconciliation_progress,
+        )
+
+        clear_payroll_reconciliation_progress_cache(payroll_id)
+        remaining = StrategyOnlinePayment.get_benefits_attached_to_payroll(
+            payroll, BenefitConsumptionStatus.APPROVE_FOR_PAYMENT
+        ).count()
+        start_payroll_reconciliation_progress(payroll_id, remaining, username=username)
         user_id = self.user.id
         transaction.on_commit(
             lambda: send_request_to_reconcile.delay(payroll_id, user_id)
@@ -725,40 +742,25 @@ class CsvReconciliationService:
         extra_info_dicts = []  # To store extra_info dicts for each record
         # Build a lookup to avoid per-record queries
         benefits_by_code = {b.code: b for b in bc_qs.select_related('individual')}
-        # Pre-fill custom columns from best-effort sources
-        prefill_code_menage = []
-        prefill_numero_paie = []
-        prefill_code_client = []
+        # Pre-fill custom columns from json_ext (extra_info puis individual.json_ext)
+        prefill_by_column = {col: [] for col in self._get_additional_columns()}
         observed_schema_keys = set(extra_info_keys)
         for record in records:
             bc = benefits_by_code.get(record['code'])
             extra_info = bc.json_ext.get('extra_info', {}) if bc.json_ext else {}
+            if not isinstance(extra_info, dict):
+                extra_info = {}
             extra_info_keys.update(extra_info.keys())
             extra_info_dicts.append(extra_info)
-            # code_menage: prefer extra_info, else individual.json_ext
             ind_json = bc.individual.json_ext if getattr(bc, 'individual', None) else None
-            if isinstance(ind_json, dict):
-                observed_schema_keys.update(ind_json.keys())
-            if isinstance(extra_info, dict):
-                observed_schema_keys.update(extra_info.keys())
-            code_menage = extra_info.get('code_menage') if extra_info else None
-            if code_menage is None and ind_json:
-                code_menage = (ind_json or {}).get('code_menage')
-            prefill_code_menage.append(code_menage)
-            # numero_paie: prefer extra_info, fallback to individual.json_ext.
-            numero_paie = extra_info.get('numero_paie') if extra_info else None
-            if numero_paie is None and ind_json:
-                numero_paie = (ind_json or {}).get('numero_paie')
-            prefill_numero_paie.append(numero_paie)
-            # code_client: prefer extra_info, fallback to legacy key then individual.json_ext.
-            code_client = extra_info.get('code_client') if extra_info else None
-            if code_client is None:
-                code_client = extra_info.get('code_empreinte') if extra_info else None
-            if code_client is None and ind_json:
-                code_client = (ind_json or {}).get('code_client')
-            if code_client is None and ind_json:
-                code_client = (ind_json or {}).get('code_empreinte')
-            prefill_code_client.append(code_client)
+            if not isinstance(ind_json, dict):
+                ind_json = {}
+            observed_schema_keys.update(ind_json.keys())
+            observed_schema_keys.update(extra_info.keys())
+            for col in prefill_by_column:
+                prefill_by_column[col].append(
+                    self._resolve_json_ext_column_value(col, extra_info, ind_json)
+                )
 
         # Convert to DataFrame
         df = pd.DataFrame.from_records(records)
@@ -788,12 +790,11 @@ class CsvReconciliationService:
             if col not in df.columns:
                 df[col] = None
         # Pre-fill additional custom columns when possible
-        if 'code_menage' in df.columns and prefill_code_menage:
-            df['code_menage'] = prefill_code_menage
-        if 'numero_paie' in df.columns and prefill_numero_paie:
-            df['numero_paie'] = prefill_numero_paie
-        if 'code_client' in df.columns and prefill_code_client:
-            df['code_client'] = prefill_code_client
+        for col, values in prefill_by_column.items():
+            if col in df.columns and values:
+                df[col] = values
+
+        df = self._order_reconciliation_export_columns(df, additional_columns)
 
         in_memory_file = BytesIO()
         # BytesIO is duck-typed as a file object, so it can be passed to df.to_csv
@@ -949,8 +950,63 @@ class CsvReconciliationService:
             raise ValueError('csv_reconciliation.validation.payroll_not_found')
         return payroll
 
+    # Colonnes toujours exportées + validées vs individual.json_ext (pas Locality).
+    # En tête d'export : localités + id_ben_principal + code_menage (avant les champs paie).
+    EXPORT_LEADING_COLUMNS = [
+        "region",
+        "prefecture",
+        "sous_prefecture",
+        "district",
+        "id_ben_principal",
+        "code_menage",
+    ]
+    STRICT_JSON_EXT_COLUMNS_DEFAULT = [
+        *EXPORT_LEADING_COLUMNS,
+    ]
+    ADDITIONAL_COLUMNS_DEFAULT = [
+        *STRICT_JSON_EXT_COLUMNS_DEFAULT,
+        "numero_paie",
+        "code_client",
+    ]
+
+    def _order_reconciliation_export_columns(self, df, additional_columns):
+        """
+        Ordre d'export :
+        region, prefecture, sous_prefecture, district, id_ben_principal, code_menage,
+        puis champs paie/bénéficiaire, Paye, optionnels, reste.
+        """
+        leading = [c for c in self.EXPORT_LEADING_COLUMNS if c in df.columns]
+        mapped = [
+            self._strip_accents(label)
+            for label in PayrollConfig.csv_reconciliation_field_mapping.values()
+        ]
+        paid = self._strip_accents(PayrollConfig.csv_reconciliation_paid_extra_field)
+        trailing_additional = [
+            c for c in (additional_columns or [])
+            if c not in self.EXPORT_LEADING_COLUMNS
+        ]
+        preferred = leading + mapped + [paid] + trailing_additional
+        ordered = []
+        for col in preferred:
+            if col in df.columns and col not in ordered:
+                ordered.append(col)
+        for col in df.columns:
+            if col not in ordered:
+                ordered.append(col)
+        return df[ordered]
+
+    def _get_strict_json_ext_columns(self):
+        cols = getattr(PayrollConfig, "csv_reconciliation_strict_json_ext_columns", None)
+        if not cols:
+            cols = self.STRICT_JSON_EXT_COLUMNS_DEFAULT
+        normalized = []
+        for col in cols:
+            if col and col not in normalized:
+                normalized.append(col)
+        return normalized
+
     def _get_additional_columns(self):
-        _default = ["code_menage", "numero_paie", "code_client"]
+        _default = self.ADDITIONAL_COLUMNS_DEFAULT
         try:
             cols = getattr(PayrollConfig, 'csv_reconciliation_additional_columns', None) or _default
         except Exception:
@@ -961,19 +1017,43 @@ class CsvReconciliationService:
                 col = "code_client"
             if col not in normalized:
                 normalized.append(col)
+        # Garantit les colonnes strictes même si ModuleConfiguration est obsolète.
+        for col in self._get_strict_json_ext_columns():
+            if col not in normalized:
+                normalized.append(col)
         return normalized
+
+    @staticmethod
+    def _resolve_json_ext_column_value(column, extra_info, ind_json):
+        """Lit une colonne additionnelle depuis extra_info puis individual.json_ext."""
+        extra_info = extra_info if isinstance(extra_info, dict) else {}
+        ind_json = ind_json if isinstance(ind_json, dict) else {}
+        value = extra_info.get(column)
+        if value is None and column == "code_client":
+            value = extra_info.get("code_empreinte")
+        if value is None:
+            value = ind_json.get(column)
+        if value is None and column == "code_client":
+            value = ind_json.get("code_empreinte")
+        return value
 
     def _resolve_optional_additional_columns(self, columns, observed_schema_keys):
         """
         Ajoute code_client / numero_paie uniquement s'ils existent dans le schéma de données
         (keys observées dans individual.json_ext ou benefit.json_ext.extra_info).
+        Les colonnes strictes (region, id_ben_principal, …) restent toujours présentes.
         """
         cols = list(columns or [])
         schema_keys = set(observed_schema_keys or set())
-        if "numero_paie" in cols and "numero_paie" not in schema_keys:
+        strict = set(self._get_strict_json_ext_columns())
+        if "numero_paie" in cols and "numero_paie" not in schema_keys and "numero_paie" not in strict:
             cols.remove("numero_paie")
         code_client_keys = {"code_client", "code_empreinte"}
-        if "code_client" in cols and not (schema_keys & code_client_keys):
+        if (
+            "code_client" in cols
+            and "code_client" not in strict
+            and not (schema_keys & code_client_keys)
+        ):
             cols.remove("code_client")
         return cols
 
@@ -1016,28 +1096,41 @@ class CsvReconciliationService:
     def _validate_additional_columns(self, row, bc, errors):
         """Valide le format et la cohérence des colonnes additionnelles."""
         max_length = 255
+        strict_columns = set(self._get_strict_json_ext_columns())
         for col in self._get_additional_columns():
             if col not in row.index:
                 continue
             val = row[col]
             val_str = "" if (pd.isna(val) or not str(val).strip()) else str(val).strip()
 
-            # code_menage : requis et identique à individual.json_ext["code_menage"]
-            if col == 'code_menage' and bc and getattr(bc, 'individual', None):
+            # Colonnes strictes : requis et identiques à individual.json_ext[col]
+            # (extra_info en secours, jamais Locality).
+            if col in strict_columns and bc and getattr(bc, 'individual', None):
                 ind_json = (bc.individual.json_ext or {}) if bc.individual.json_ext else {}
-                ind_code_menage = ind_json.get('code_menage')
-                ind_code_menage_str = (
-                    str(ind_code_menage).strip() if ind_code_menage is not None and str(ind_code_menage).strip()
+                extra_info = {}
+                if isinstance(bc.json_ext, dict):
+                    extra_info = bc.json_ext.get('extra_info') or {}
+                    if not isinstance(extra_info, dict):
+                        extra_info = {}
+                expected = self._resolve_json_ext_column_value(col, extra_info, ind_json)
+                expected_str = (
+                    str(expected).strip() if expected is not None and str(expected).strip()
                     else None
                 )
-                if ind_code_menage_str is None:
-                    errors.append(_('Individual must have code_menage (household code)'))
-                elif not val_str:
-                    errors.append(_('code_menage is required in the reconciliation file'))
-                elif val_str != ind_code_menage_str:
+                if expected_str is None:
                     errors.append(
-                        _('code_menage must match the individual household code: expected "%(expected)s"')
-                        % {'expected': ind_code_menage_str}
+                        _('Individual must have %(column)s in json_ext')
+                        % {'column': col}
+                    )
+                elif not val_str:
+                    errors.append(
+                        _('%(column)s is required in the reconciliation file')
+                        % {'column': col}
+                    )
+                elif val_str != expected_str:
+                    errors.append(
+                        _('%(column)s must match individual json_ext: expected "%(expected)s"')
+                        % {'column': col, 'expected': expected_str}
                     )
                 continue
 
@@ -1115,6 +1208,23 @@ class CsvReconciliationService:
         }
         bc.json_ext = {'extra_info': extra_info}
         benefit_status_only_save(bc, self.user.login_name)
+        try:
+            from payroll.numero_paie_sync import (
+                SOURCE_CSV,
+                sync_numero_paie_from_mapping,
+            )
+
+            sync_numero_paie_from_mapping(
+                bc,
+                row,
+                source=SOURCE_CSV,
+                username=self.user.login_name,
+            )
+        except Exception:
+            logger.exception(
+                "[CsvReconciliation] numero_paie sync failed benefit=%s",
+                getattr(bc, "code", None),
+            )
         if bill is None:
             bill = Bill.objects.filter(benefitattachment__benefit=bc, is_deleted=False).first()
         if bill:

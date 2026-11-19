@@ -1,7 +1,7 @@
 from datetime import timedelta
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.test import SimpleTestCase
 from django.utils import timezone
 
 from payroll.payment_progress import (
@@ -12,7 +12,7 @@ from payroll.payment_progress import (
 )
 
 
-class PaymentProgressStaleRecoveryTests(TestCase):
+class PaymentProgressStaleRecoveryTests(SimpleTestCase):
     def _payroll_stub(self, *, payment_in_progress=True, payment_progress=None):
         class Payroll:
             id = "00000000-0000-0000-0000-000000000001"
@@ -65,6 +65,38 @@ class PaymentProgressStaleRecoveryTests(TestCase):
 
         result = reconcile_payment_progress_for_payroll(payroll)
 
+        self.assertEqual(result["status"], STATUS_IN_PROGRESS)
+        self.assertFalse(result["should_stop_polling"])
+
+    @patch("payroll.payment_progress.cache")
+    def test_db_progress_wins_over_stale_api_cache(self, mock_cache):
+        stale_started = (timezone.now() - timedelta(minutes=10)).isoformat()
+        fresh = (timezone.now() - timedelta(seconds=20)).isoformat()
+        mock_cache.get.return_value = {
+            "status": STATUS_IN_PROGRESS,
+            "processed_beneficiaries": 0,
+            "total_beneficiaries": 0,
+            "success_count": 0,
+            "rejected_count": 0,
+            "updated_at": stale_started,
+            "started_at": stale_started,
+        }
+        payroll = self._payroll_stub(
+            payment_progress={
+                "status": STATUS_IN_PROGRESS,
+                "processed_beneficiaries": 450,
+                "total_beneficiaries": 57850,
+                "success_count": 450,
+                "rejected_count": 0,
+                "updated_at": fresh,
+                "started_at": stale_started,
+            }
+        )
+
+        result = reconcile_payment_progress_for_payroll(payroll)
+
+        self.assertEqual(result["processed_beneficiaries"], 450)
+        self.assertEqual(result["total_beneficiaries"], 57850)
         self.assertEqual(result["status"], STATUS_IN_PROGRESS)
         self.assertFalse(result["should_stop_polling"])
 

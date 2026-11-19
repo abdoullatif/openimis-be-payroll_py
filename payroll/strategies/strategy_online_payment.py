@@ -214,13 +214,46 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
 
         try:
             for index, benefit in enumerate(benefits, start=1):
-                code_menage = cls._get_code_menage(benefit)
+                from payroll.models import Payroll as PayrollModel
+                from payroll.reconciliation_lock import is_payment_cancel_requested
+
+                live_payroll = PayrollModel.objects.filter(id=payroll.id, is_deleted=False).first()
+                if live_payroll and is_payment_cancel_requested(live_payroll):
+                    from payroll.payment_progress import (
+                        cancel_payroll_payment_progress,
+                        update_payroll_payment_progress,
+                    )
+
+                    done = index - 1
+                    update_payroll_payment_progress(
+                        payroll_id,
+                        done,
+                        total,
+                        success_count=success_count,
+                        rejected_count=rejected_count,
+                        username=username,
+                        force=True,
+                    )
+                    cancel_payroll_payment_progress(
+                        payroll_id,
+                        reason="Payment stopped by user.",
+                        username=username,
+                    )
+                    logger.warning(
+                        "[Passerelle] Payment loop stopped by user payroll_id=%s at %s/%s",
+                        payroll_id,
+                        done,
+                        total,
+                    )
+                    break
+
+                id_ben_principal = cls._get_id_ben_principal(benefit)
                 if payment_gateway_connector.send_payment(
                     benefit.code,
                     benefit.amount,
                     projet=projet,
                     campagne=campagne,
-                    code_menage=code_menage,
+                    id_ben_principal=id_ben_principal,
                 ):
                     benefit.status = BenefitConsumptionStatus.APPROVE_FOR_PAYMENT
                     benefit_status_only_save(benefit, user.login_name)
@@ -246,22 +279,32 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
                         BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
                     )
                     pending_os_sync_ids = []
+            else:
+                # boucle terminée sans break (pas d'annulation)
+                if pending_os_sync_ids:
+                    sync_benefit_status_batch_to_opensearch(
+                        payroll_id,
+                        pending_os_sync_ids,
+                        BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
+                    )
 
+                complete_payroll_payment_progress(
+                    payroll_id,
+                    total,
+                    total,
+                    success_count=success_count,
+                    rejected_count=rejected_count,
+                    username=username,
+                )
+                return
+
+            # sortie via break (annulation) : sync partiel éventuel
             if pending_os_sync_ids:
                 sync_benefit_status_batch_to_opensearch(
                     payroll_id,
                     pending_os_sync_ids,
                     BenefitConsumptionStatus.APPROVE_FOR_PAYMENT,
                 )
-
-            complete_payroll_payment_progress(
-                payroll_id,
-                total,
-                total,
-                success_count=success_count,
-                rejected_count=rejected_count,
-                username=username,
-            )
         except Exception as exc:
             fail_payroll_payment_progress(payroll_id, exc, username=username)
             raise
@@ -275,12 +318,21 @@ class StrategyOnlinePayment(StrategyOfPaymentInterface):
 
     @classmethod
     def _get_code_menage(cls, benefit):
-        """code_menage depuis extra_info du benefit ou json_ext de l'individual"""
+        """code_menage depuis extra_info du benefit ou json_ext de l'individual (CSV offline)."""
         extra_info = (benefit.json_ext or {}).get("extra_info") or {}
         code_menage = extra_info.get("code_menage")
         if code_menage is None and benefit.individual and benefit.individual.json_ext:
             code_menage = (benefit.individual.json_ext or {}).get("code_menage")
         return code_menage
+
+    @classmethod
+    def _get_id_ben_principal(cls, benefit):
+        """id_ben_principal depuis extra_info du benefit ou json_ext de l'individual (passerelle)."""
+        extra_info = (benefit.json_ext or {}).get("extra_info") or {}
+        id_ben = extra_info.get("id_ben_principal")
+        if id_ben is None and benefit.individual and benefit.individual.json_ext:
+            id_ben = (benefit.individual.json_ext or {}).get("id_ben_principal")
+        return id_ben
 
     @classmethod
     def _get_payroll_campaign(cls, payroll):

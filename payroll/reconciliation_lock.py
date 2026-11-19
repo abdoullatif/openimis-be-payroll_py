@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 
 RECONCILIATION_IN_PROGRESS_KEY = "reconciliation_in_progress"
 PAYMENT_IN_PROGRESS_KEY = "payment_in_progress"
+PAYMENT_CANCEL_REQUESTED_KEY = "payment_cancel_requested"
+RECONCILIATION_CANCEL_REQUESTED_KEY = "reconciliation_cancel_requested"
 
 # Tant qu'une tâche de clôture existe et n'est pas rejetée, plus de réconciliation.
 _RECONCILIATION_LOCK_STATUSES = (
@@ -63,8 +65,10 @@ def _save_payroll_json_ext_flags(payroll, user):
 def set_reconciliation_in_progress(payroll, user, in_progress):
     json_ext = dict(payroll.json_ext or {})
     already = bool(json_ext.get(RECONCILIATION_IN_PROGRESS_KEY))
+    had_cancel = bool(json_ext.get(RECONCILIATION_CANCEL_REQUESTED_KEY))
     if in_progress:
-        if already:
+        json_ext.pop(RECONCILIATION_CANCEL_REQUESTED_KEY, None)
+        if already and not had_cancel:
             return
         json_ext[RECONCILIATION_IN_PROGRESS_KEY] = True
     else:
@@ -75,11 +79,38 @@ def set_reconciliation_in_progress(payroll, user, in_progress):
     _save_payroll_json_ext_flags(payroll, user)
 
 
+def is_payment_cancel_requested(payroll):
+    return bool((payroll.json_ext or {}).get(PAYMENT_CANCEL_REQUESTED_KEY))
+
+
+def is_reconciliation_cancel_requested(payroll):
+    return bool((payroll.json_ext or {}).get(RECONCILIATION_CANCEL_REQUESTED_KEY))
+
+
+def request_payment_stop(payroll, user):
+    """Arrêt explicite demandé par l'utilisateur (ne pas confondre avec un cache périmé)."""
+    json_ext = dict(payroll.json_ext or {})
+    json_ext[PAYMENT_CANCEL_REQUESTED_KEY] = True
+    json_ext.pop(PAYMENT_IN_PROGRESS_KEY, None)
+    payroll.json_ext = json_ext
+    _save_payroll_json_ext_flags(payroll, user)
+
+
+def request_reconciliation_stop(payroll, user):
+    json_ext = dict(payroll.json_ext or {})
+    json_ext[RECONCILIATION_CANCEL_REQUESTED_KEY] = True
+    json_ext.pop(RECONCILIATION_IN_PROGRESS_KEY, None)
+    payroll.json_ext = json_ext
+    _save_payroll_json_ext_flags(payroll, user)
+
+
 def set_payment_in_progress(payroll, user, in_progress):
     json_ext = dict(payroll.json_ext or {})
     already = bool(json_ext.get(PAYMENT_IN_PROGRESS_KEY))
+    had_cancel = bool(json_ext.get(PAYMENT_CANCEL_REQUESTED_KEY))
     if in_progress:
-        if already:
+        json_ext.pop(PAYMENT_CANCEL_REQUESTED_KEY, None)
+        if already and not had_cancel:
             return
         json_ext[PAYMENT_IN_PROGRESS_KEY] = True
     else:

@@ -14,7 +14,8 @@ CACHE_TIMEOUT_SECONDS = 86400
 PROGRESS_UPDATE_INTERVAL = 50
 STALE_PAYMENT_PROGRESS_MINUTES = 480
 # Worker Celery tué / plus de mises à jour : libérer le verrou plus tôt.
-PAYMENT_WORKER_STALE_MINUTES = 3
+# Inactivité réelle (json_ext), pas l'âge du cache LocMem du process API.
+PAYMENT_WORKER_STALE_MINUTES = 15
 
 STATUS_IN_PROGRESS = "IN_PROGRESS"
 STATUS_COMPLETED = "COMPLETED"
@@ -107,10 +108,16 @@ def update_payroll_payment_progress(
     success_count=0,
     rejected_count=0,
     username=None,
+    force=False,
 ):
     total = max(0, int(total or 0))
     processed = max(0, int(processed or 0))
-    if total > 0 and processed % PROGRESS_UPDATE_INTERVAL != 0 and processed != total:
+    if (
+        not force
+        and total > 0
+        and processed % PROGRESS_UPDATE_INTERVAL != 0
+        and processed != total
+    ):
         return None
     existing = cache.get(_cache_key(payroll_id)) or {}
     if existing.get("status") in TERMINAL_STATUSES:
@@ -211,6 +218,37 @@ def fail_payroll_payment_progress(payroll_id, error_message, username=None):
     return payload
 
 
+def _progress_sort_key(payload):
+    if not isinstance(payload, dict):
+        return datetime.min
+    return _parse_progress_timestamp(
+        payload.get("updated_at") or payload.get("completed_at") or payload.get("started_at")
+    ) or datetime.min
+
+
+def prefer_fresher_payment_progress(cache_payload, db_payload):
+    """Le cache LocMem n'est pas partagé entre l'API et Celery : la DB gagne si plus récente."""
+    if not isinstance(cache_payload, dict) or not cache_payload:
+        return db_payload if isinstance(db_payload, dict) else None
+    if not isinstance(db_payload, dict) or not db_payload:
+        return cache_payload
+    cache_processed = int(cache_payload.get("processed_beneficiaries") or 0)
+    db_processed = int(db_payload.get("processed_beneficiaries") or 0)
+    cache_total = int(cache_payload.get("total_beneficiaries") or 0)
+    db_total = int(db_payload.get("total_beneficiaries") or 0)
+    # L'API écrit 0/0 (ou 0/N au start) dans son LocMem et ne le met plus à jour.
+    if cache_processed == 0 and (db_processed > 0 or (cache_total == 0 and db_total > 0)):
+        return db_payload
+    # Toujours préférer le snapshot avec le plus de traités (évite un LocMem API à 0/N)
+    if db_processed > cache_processed:
+        return db_payload
+    if cache_processed > db_processed:
+        return cache_payload
+    if _progress_sort_key(db_payload) >= _progress_sort_key(cache_payload):
+        return db_payload
+    return cache_payload
+
+
 def get_payroll_payment_progress(payroll_id):
     return cache.get(_cache_key(payroll_id))
 
@@ -287,9 +325,24 @@ def _recover_active_payment_progress(payroll, payload):
     return recovered
 
 
+def _stored_payment_progress(payroll_id):
+    from payroll.models import Payroll
+
+    stored = (
+        Payroll.objects.filter(id=payroll_id, is_deleted=False)
+        .values_list("json_ext", flat=True)
+        .first()
+    )
+    if not isinstance(stored, dict):
+        return {}
+    progress = stored.get("payment_progress")
+    return progress if isinstance(progress, dict) else {}
+
+
 def cancel_payroll_payment_progress(payroll_id, reason=None, username=None):
     """Arrêt explicite ou job Celery tué : le front doit arrêter le polling."""
-    existing = cache.get(_cache_key(payroll_id)) or {}
+    cached = cache.get(_cache_key(payroll_id)) or {}
+    existing = prefer_fresher_payment_progress(cached, _stored_payment_progress(payroll_id)) or {}
     payload = {
         "status": STATUS_CANCELLED,
         "phase": "CANCELLED",
@@ -324,8 +377,10 @@ def reconcile_payment_progress_for_payroll(payroll):
 
     payroll_id = str(payroll.id)
     flag_active = is_payment_in_progress(payroll)
-    payload = get_payroll_payment_progress(payroll_id) or (payroll.json_ext or {}).get(
-        "payment_progress"
+    db_payload = (payroll.json_ext or {}).get("payment_progress")
+    payload = prefer_fresher_payment_progress(
+        get_payroll_payment_progress(payroll_id),
+        db_payload if isinstance(db_payload, dict) else None,
     )
 
     if not payload:
@@ -396,6 +451,11 @@ def _progress_snapshot_unchanged(existing, new_payload):
 def persist_payment_progress_to_payroll(payroll, progress_payload, username):
     if not progress_payload:
         return
+    if hasattr(payroll, "refresh_from_db"):
+        try:
+            payroll.refresh_from_db(fields=["json_ext"])
+        except Exception:
+            pass
     existing = (payroll.json_ext or {}).get("payment_progress")
     if _progress_snapshot_unchanged(existing, progress_payload):
         return

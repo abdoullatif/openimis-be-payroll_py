@@ -91,10 +91,17 @@ def send_requests_to_gateway_payment(payroll_id, user_id):
         payroll.refresh_from_db()
         set_payment_in_progress(payroll, user, False)
         from payroll.payment_progress import get_payroll_payment_progress, persist_payment_progress_to_payroll
+        from payroll.notifications import notify_payment_finished
 
         progress = get_payroll_payment_progress(str(payroll_id))
         if progress:
             persist_payment_progress_to_payroll(payroll, progress, username)
+        try:
+            notify_payment_finished(payroll, user, progress)
+        except Exception:
+            logger.exception(
+                "[Celery] notify_payment_finished failed payroll_id=%s", payroll_id
+            )
 
 
 @shared_task
@@ -117,7 +124,9 @@ def send_request_to_reconcile(payroll_id, user_id):
             fail_payroll_reconciliation_progress,
             start_payroll_reconciliation_progress,
             update_payroll_reconciliation_progress,
+            cancel_payroll_reconciliation_progress,
         )
+        from payroll.reconciliation_lock import is_reconciliation_cancel_requested
 
         total = len(benefits)
         start_payroll_reconciliation_progress(payroll_id_str, total, username=username)
@@ -128,13 +137,30 @@ def send_request_to_reconcile(payroll_id, user_id):
         success_count = 0
         rejected_count = 0
         processed = 0
+        cancelled = False
         for benefit in benefits:
+            live = Payroll.objects.filter(id=payroll_id, is_deleted=False).first()
+            if live and is_reconciliation_cancel_requested(live):
+                cancel_payroll_reconciliation_progress(
+                    payroll_id_str,
+                    reason="Reconciliation stopped by user.",
+                    username=username,
+                )
+                cancelled = True
+                logger.warning(
+                    "[Passerelle] Reconciliation loop stopped by user payroll_id=%s at %s/%s",
+                    payroll_id,
+                    processed,
+                    total,
+                )
+                break
+
             processed += 1
-            code_menage = strategy._get_code_menage(benefit)
+            id_ben_principal = strategy._get_id_ben_principal(benefit)
             gateway_result = normalize_reconciliation_gateway_result(
                 payment_gateway_connector.reconcile(
                     benefit.code, benefit.amount,
-                    projet=projet, campagne=campagne, code_menage=code_menage
+                    projet=projet, campagne=campagne, id_ben_principal=id_ben_principal
                 )
             )
             if apply_gateway_pull_result(benefit, gateway_result):
@@ -144,6 +170,25 @@ def send_request_to_reconcile(payroll_id, user_id):
                 if gateway_result.get("receipt"):
                     operator_receipts[benefit.code] = gateway_result["receipt"]
                 benefits_to_reconcile.append(benefit)
+                if gateway_result.get("numero_paie"):
+                    try:
+                        from payroll.numero_paie_sync import (
+                            SOURCE_GATEWAY_PULL,
+                            sync_numero_paie_from_operator,
+                        )
+
+                        sync_numero_paie_from_operator(
+                            benefit,
+                            gateway_result.get("numero_paie"),
+                            source=SOURCE_GATEWAY_PULL,
+                            username=username,
+                            invoice_id=benefit.code,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[Passerelle] numero_paie sync failed benefit=%s",
+                            benefit.code,
+                        )
             else:
                 rejected_count += 1
                 logger.info("Payment for benefit (%s) was rejected.", benefit.code)
@@ -159,17 +204,18 @@ def send_request_to_reconcile(payroll_id, user_id):
             strategy.reconcile_benefit_consumption(
                 benefits_to_reconcile, user, operator_receipts=operator_receipts
             )
-        record_reconciliation_run_summary(
-            payroll, user, success_count=success_count, rejected_count=rejected_count
-        )
-        complete_payroll_reconciliation_progress(
-            payroll_id_str,
-            processed,
-            total,
-            success_count=success_count,
-            rejected_count=rejected_count,
-            username=username,
-        )
+        if not cancelled:
+            record_reconciliation_run_summary(
+                payroll, user, success_count=success_count, rejected_count=rejected_count
+            )
+            complete_payroll_reconciliation_progress(
+                payroll_id_str,
+                processed,
+                total,
+                success_count=success_count,
+                rejected_count=rejected_count,
+                username=username,
+            )
     except Exception:
         from payroll.reconciliation_progress import fail_payroll_reconciliation_progress
 
@@ -184,7 +230,14 @@ def send_request_to_reconcile(payroll_id, user_id):
             get_payroll_reconciliation_progress,
             persist_reconciliation_progress_to_payroll,
         )
+        from payroll.notifications import notify_reconciliation_finished
 
         progress = get_payroll_reconciliation_progress(payroll_id_str)
         if progress:
             persist_reconciliation_progress_to_payroll(payroll, progress, username)
+        try:
+            notify_reconciliation_finished(payroll, user, progress)
+        except Exception:
+            logger.exception(
+                "[Celery] notify_reconciliation_finished failed payroll_id=%s", payroll_id
+            )
